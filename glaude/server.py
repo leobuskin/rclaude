@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import shutil
 from dataclasses import dataclass
+from pathlib import Path
 
 from aiohttp import web
 from telegram import Update
@@ -20,11 +22,24 @@ from claude_agent_sdk import (
     ToolResultBlock,
 )
 
-from pathlib import Path
-
 from glaude.settings import Config
-from glaude.session import get_session, PendingQuestion, UserSession
+from glaude.session import get_session, PendingQuestion, UserSession, SessionUpdate
 from glaude.formatting import send_text, send_tool_call, send_tool_result, create_question_keyboard
+
+
+def get_local_claude_cli() -> str | None:
+    """Find local Claude CLI, prefer it over SDK bundled version."""
+    # Check common locations
+    local_claude = Path.home() / '.claude' / 'local' / 'claude'
+    if local_claude.exists():
+        return str(local_claude)
+
+    # Fallback to PATH
+    claude_path = shutil.which('claude')
+    if claude_path:
+        return claude_path
+
+    return None  # Will use SDK bundled
 
 
 def can_resume_session(session_id: str, cwd: str) -> bool:
@@ -114,6 +129,46 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({'status': 'ok'})
 
 
+async def handle_stream(request: web.Request) -> web.StreamResponse:
+    """SSE endpoint to stream session updates to terminal."""
+    config: Config = request.app['config']
+    user_id = config.telegram.user_id
+
+    if not user_id:
+        return web.json_response({'error': 'No user configured'}, status=400)
+
+    session = get_session(user_id)
+
+    response = web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+        },
+    )
+    await response.prepare(request)
+
+    # Send initial connection message
+    await response.write(b'event: connected\ndata: {}\n\n')
+
+    try:
+        while True:
+            try:
+                # Wait for updates with timeout
+                update = await asyncio.wait_for(session.update_queue.get(), timeout=30)
+                data = json.dumps({'type': update.type, 'content': update.content})
+                await response.write(f'event: update\ndata: {data}\n\n'.encode())
+            except asyncio.TimeoutError:
+                # Send keepalive
+                await response.write(b'event: keepalive\ndata: {}\n\n')
+    except asyncio.CancelledError:
+        pass
+
+    return response
+
+
 async def handle_setup_link_register(request: web.Request) -> web.Response:
     """Register a setup link token. Called by setup wizard."""
     try:
@@ -168,6 +223,7 @@ def create_http_app(config: Config) -> web.Application:
 
     app.router.add_post('/teleport', handle_teleport)
     app.router.add_get('/health', handle_health)
+    app.router.add_get('/stream', handle_stream)
 
     # Setup link endpoints
     app.router.add_post('/api/setup-link', handle_setup_link_register)
@@ -244,10 +300,17 @@ async def tg_handle_cc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text('No active session. Start one first.')
         return
 
-    # Get session ID from the client
-    # Note: we'd need to track this - for now just show the cwd
+    # Signal wrapper to return to terminal
+    session_id = session.session_id or 'latest'
+    await session.update_queue.put(SessionUpdate('return_to_terminal', session_id))
+
+    # Disconnect the TG session
+    if session.client:
+        await session.client.disconnect()
+        session.client = None
+
     await update.message.reply_text(
-        f'💻 Return to terminal:\n\n```\ncd {session.cwd}\nclaude --resume\n```\n\nOr start fresh with: `claude`',
+        f'💻 Returning to terminal...\n\nSession: `{session_id[:8] if len(session_id) > 8 else session_id}...`\nDirectory: `{session.cwd}`',
         parse_mode='Markdown',
     )
 
@@ -440,6 +503,7 @@ async def _process_response(
                         # Send any accumulated text first
                         if response_text.strip():
                             await send_text(update, response_text)
+                            await session.update_queue.put(SessionUpdate('text', response_text))
                             response_text = ''
 
                         # Handle AskUserQuestion specially
@@ -457,15 +521,21 @@ async def _process_response(
                                     reply_markup=keyboard,
                                     parse_mode='HTML',
                                 )
+                                await session.update_queue.put(SessionUpdate('question', first_q['question']))
                                 session.is_processing = False
                                 return
 
                         # Send tool call as formatted message
                         await send_tool_call(update, block)
+                        tool_desc = (
+                            f'{block.name}: {block.input.get("command", block.input.get("file_path", block.input.get("pattern", "")))}'
+                        )
+                        await session.update_queue.put(SessionUpdate('tool_call', tool_desc))
 
                     elif isinstance(block, ToolResultBlock):
                         # Send tool result as expandable quote
                         await send_tool_result(update, block)
+                        # Don't send full tool results to terminal (too verbose)
 
             elif isinstance(message, ResultMessage):
                 if message.is_error and message.result:
@@ -482,6 +552,7 @@ async def _process_response(
     # Send any remaining text
     if response_text.strip():
         await send_text(update, response_text)
+        await session.update_queue.put(SessionUpdate('text', response_text))
 
 
 async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -530,8 +601,10 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 permission_mode='acceptEdits',
                 cwd=session.cwd,
                 resume=teleport.session_id if resumable else None,
+                cli_path=get_local_claude_cli(),
             )
             session.client = ClaudeSDKClient(options=options)
+            session.session_id = teleport.session_id  # Track for /cc
             await session.client.connect()
 
             if resumable:
@@ -541,6 +614,9 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception as e:
             await update.message.reply_text(f'Failed to connect: {e}')
             return
+
+    # Push user message to stream
+    await session.update_queue.put(SessionUpdate('user', text))
 
     # Handle waiting for custom answer
     if context.user_data.get('waiting_for_answer') and session.pending_question:
@@ -588,6 +664,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 ],
                 permission_mode='acceptEdits',
                 cwd=session.cwd,
+                cli_path=get_local_claude_cli(),
             )
             session.client = ClaudeSDKClient(options=options)
             await session.client.connect()

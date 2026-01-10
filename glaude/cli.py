@@ -12,12 +12,18 @@ from glaude.settings import load_config, CONFIG_FILE
 @click.group(invoke_without_command=True)
 @click.option('--version', '-V', is_flag=True, help='Show version')
 @click.option('--reload', '-r', is_flag=True, help='Start server in reload mode (dev)')
+@click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
 @click.pass_context
-def main(ctx: click.Context, version: bool, reload: bool) -> None:
+def main(ctx: click.Context, version: bool, reload: bool, verbose: bool) -> None:
     """Glaude - Remote Claude Code control via Telegram.
 
     Run without arguments to start Claude Code with teleportation support.
     """
+    if verbose:
+        import logging
+
+        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
     if version:
         click.echo(f'glaude {__version__}')
         return
