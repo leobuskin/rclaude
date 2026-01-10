@@ -59,38 +59,43 @@ def start_server_background(config: Config) -> subprocess.Popen:
 
 
 def tail_session_log(session_id: str, cwd: str) -> None:
-    """Tail the session log file to show updates."""
-    # Find the session log file
+    """Tail session log files to show updates.
+
+    If the original session is empty, Telegram may create a new session.
+    We watch all .jsonl files in the project directory.
+    """
     project_path = cwd.replace('/', '-').replace(':', '')
     if project_path.startswith('-'):
         project_path = project_path[1:]
 
     log_dir = Path.home() / '.claude' / 'projects' / f'-{project_path}'
-    log_file = log_dir / f'{session_id}.jsonl'
 
-    if not log_file.exists():
-        print(f'Session log not found: {log_file}')
+    if not log_dir.exists():
+        print(f'Session log directory not found: {log_dir}')
         return
 
     print('\n📱 Session on Telegram. Showing live updates...')
-    print(f'   Log: {log_file}')
+    print(f'   Directory: {log_dir}')
     print('   Press Ctrl+C to exit.\n')
     print('─' * 60)
 
-    # Tail the file
+    # Watch all jsonl files in the project directory
+    # This handles the case where Telegram creates a new session
     try:
         with subprocess.Popen(
-            ['tail', '-f', str(log_file)],
+            ['tail', '-f'] + [str(f) for f in log_dir.glob('*.jsonl')],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
         ) as proc:
             assert proc.stdout
             for line in proc.stdout:
+                # Skip tail's "==> filename <==" headers
+                if line.startswith('==>') and line.endswith('<==\n'):
+                    continue
+
                 # Parse JSONL and show relevant parts
                 try:
-                    import json
-
                     data = json.loads(line)
                     msg_type = data.get('type')
 
@@ -98,12 +103,14 @@ def tail_session_log(session_id: str, cwd: str) -> None:
                         content = data.get('message', {}).get('content', [])
                         for block in content:
                             if block.get('type') == 'text':
-                                print(f'Claude: {block.get("text", "")[:200]}')
+                                text = block.get('text', '')[:200]
+                                if text:
+                                    print(f'Claude: {text}')
                             elif block.get('type') == 'tool_use':
                                 print(f'  → {block.get("name")}')
                     elif msg_type == 'user':
                         content = data.get('message', {}).get('content', '')
-                        if isinstance(content, str):
+                        if isinstance(content, str) and content:
                             print(f'You (TG): {content[:100]}')
                 except json.JSONDecodeError:
                     pass
