@@ -1,5 +1,6 @@
 """Session management for Claude SDK clients."""
 
+import asyncio
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -18,6 +19,14 @@ class PendingQuestion:
 
 
 @dataclass
+class SessionUpdate:
+    """An update to broadcast to listeners."""
+
+    type: str  # 'text', 'tool_call', 'tool_result', 'user', 'error'
+    content: str
+
+
+@dataclass
 class UserSession:
     """Manages a user's Claude session state."""
 
@@ -25,6 +34,9 @@ class UserSession:
     is_processing: bool = False
     pending_question: PendingQuestion | None = None
     cwd: str = field(default_factory=os.getcwd)
+    session_id: str | None = None  # Track current session ID for /cc
+    # Queue for streaming updates to terminal
+    update_queue: asyncio.Queue[SessionUpdate] = field(default_factory=asyncio.Queue)
 
 
 # Global session storage (in production, use Redis or similar)

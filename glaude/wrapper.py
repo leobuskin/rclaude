@@ -63,67 +63,63 @@ def start_server_background(config: Config, reload: bool = False) -> subprocess.
     raise RuntimeError('Failed to start glaude server')
 
 
-def tail_session_log(session_id: str, cwd: str) -> None:
-    """Tail the specific session log file to show updates."""
-    project_path = cwd.replace('/', '-').replace(':', '')
-    if project_path.startswith('-'):
-        project_path = project_path[1:]
+def stream_session_updates(config: Config, session_id: str) -> str | None:
+    """Stream session updates from server via SSE.
 
-    log_dir = Path.home() / '.claude' / 'projects' / f'-{project_path}'
-    log_file = log_dir / f'{session_id}.jsonl'
+    Returns session_id if we should resume in terminal, None otherwise.
+    """
+    import urllib.request
+    import urllib.error
 
     print('\n📱 Session on Telegram. Showing live updates...')
-    print(f'   Session: {session_id}')
-    print('   Press Ctrl+C to exit.\n')
+    print(f'   Session: {session_id[:8]}...')
+    print('   Press Ctrl+C to return to terminal.\n')
     print('─' * 60)
 
-    # Wait for file to exist if needed
-    if not log_file.exists():
-        print('Waiting for session activity...')
-        for _ in range(30):  # 30 second timeout
-            time.sleep(1)
-            if log_file.exists():
-                break
-        if not log_file.exists():
-            print('No session activity detected.')
-            return
+    url = f'http://{config.server.host}:{config.server.port}/stream'
 
     try:
-        # Use -n 0 to only show NEW lines (skip existing content)
-        with subprocess.Popen(
-            ['tail', '-f', '-n', '0', str(log_file)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ) as proc:
-            assert proc.stdout
-            for line in proc.stdout:
-                # Skip tail's "==> filename <==" headers
-                if line.startswith('==>') and line.endswith('<==\n'):
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req) as response:
+            for line in response:
+                line = line.decode('utf-8').strip()
+
+                if line.startswith('event:'):
+                    # Skip event type lines, we handle data directly
                     continue
 
-                # Parse JSONL and show relevant parts
-                try:
-                    data = json.loads(line)
-                    msg_type = data.get('type')
+                if line.startswith('data:'):
+                    data_str = line[5:].strip()
+                    if not data_str or data_str == '{}':
+                        continue
 
-                    if msg_type == 'assistant':
-                        content = data.get('message', {}).get('content', [])
-                        for block in content:
-                            if block.get('type') == 'text':
-                                text = block.get('text', '')[:200]
-                                if text:
-                                    print(f'Claude: {text}')
-                            elif block.get('type') == 'tool_use':
-                                print(f'  → {block.get("name")}')
-                    elif msg_type == 'user':
-                        content = data.get('message', {}).get('content', '')
-                        if isinstance(content, str) and content:
+                    try:
+                        data = json.loads(data_str)
+                        update_type = data.get('type', '')
+                        content = data.get('content', '')
+
+                        if update_type == 'user':
                             print(f'You (TG): {content[:100]}')
-                except json.JSONDecodeError:
-                    pass
+                        elif update_type == 'text':
+                            # Truncate long text
+                            display = content[:200] + '...' if len(content) > 200 else content
+                            print(f'Claude: {display}')
+                        elif update_type == 'tool_call':
+                            print(f'  → {content}')
+                        elif update_type == 'question':
+                            print(f'  ? {content}')
+                        elif update_type == 'return_to_terminal':
+                            print('\n💻 Returning to terminal...')
+                            return content  # Return session_id to resume
+                    except json.JSONDecodeError:
+                        pass
+
+    except urllib.error.URLError as e:
+        print(f'Connection error: {e.reason}')
     except KeyboardInterrupt:
-        print('\n\nExiting tail mode.')
+        print('\n\nExiting stream mode.')
+
+    return None
 
 
 def _stop_server(proc: subprocess.Popen) -> None:
@@ -226,7 +222,17 @@ def run_claude_wrapper(config: Config, args: list[str], reload: bool = False) ->
             session_id = teleport_data.get('session_id', '')
             cwd = teleport_data.get('cwd', '.')
             signal_file.unlink(missing_ok=True)
-            tail_session_log(session_id, cwd)
+
+            # Stream updates from server, handle return-to-terminal
+            resume_session = stream_session_updates(config, session_id)
+
+            if resume_session:
+                # User ran /cc - resume Claude with session
+                print(f'\nResuming session {resume_session[:8]}...')
+                print('─' * 60)
+                resume_cmd = ['claude', '--resume', resume_session]
+                subprocess.run(resume_cmd, cwd=cwd)
+
             # Clean up server if we started it
             if server_proc:
                 _stop_server(server_proc)
