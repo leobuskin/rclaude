@@ -24,7 +24,7 @@ from pathlib import Path
 
 from glaude.settings import Config
 from glaude.session import get_session, PendingQuestion, UserSession
-from glaude.formatting import split_and_send, format_tool_use, format_tool_result, create_question_keyboard
+from glaude.formatting import send_text, send_tool_call, send_tool_result, create_question_keyboard
 
 
 def can_resume_session(session_id: str, cwd: str) -> bool:
@@ -420,7 +420,7 @@ async def _process_response(
     context: ContextTypes.DEFAULT_TYPE,
     session: UserSession,
 ) -> None:
-    """Process Claude response."""
+    """Process Claude response with rich Telegram formatting."""
     assert update.effective_chat
 
     if not session.client:
@@ -428,7 +428,6 @@ async def _process_response(
 
     session.is_processing = True
     response_text = ''
-    tool_outputs: list[str] = []
 
     try:
         async for message in session.client.receive_response():
@@ -436,10 +435,14 @@ async def _process_response(
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         response_text += block.text
-                    elif isinstance(block, ToolUseBlock):
-                        tool_desc = format_tool_use(block)
-                        tool_outputs.append(f'[{tool_desc}]')
 
+                    elif isinstance(block, ToolUseBlock):
+                        # Send any accumulated text first
+                        if response_text.strip():
+                            await send_text(update, response_text)
+                            response_text = ''
+
+                        # Handle AskUserQuestion specially
                         if block.name == 'AskUserQuestion':
                             questions = block.input.get('questions', [])
                             if questions:
@@ -449,29 +452,25 @@ async def _process_response(
                                 )
                                 first_q = questions[0]
                                 keyboard = await create_question_keyboard(first_q)
-
-                                if response_text.strip():
-                                    await split_and_send(update, response_text)
-                                    response_text = ''
-
                                 await update.effective_chat.send_message(
-                                    f'{first_q.get("header", "Question")}: {first_q["question"]}',
+                                    f'<b>{first_q.get("header", "Question")}:</b> {first_q["question"]}',
                                     reply_markup=keyboard,
+                                    parse_mode='HTML',
                                 )
                                 session.is_processing = False
                                 return
 
+                        # Send tool call as formatted message
+                        await send_tool_call(update, block)
+
                     elif isinstance(block, ToolResultBlock):
-                        result = format_tool_result(block)
-                        if result.strip():
-                            tool_outputs.append(result)
+                        # Send tool result as expandable quote
+                        await send_tool_result(update, block)
 
             elif isinstance(message, ResultMessage):
                 if message.is_error and message.result:
                     response_text += f'\n\n❌ Error: {message.result}'
-
-                if message.total_cost_usd:
-                    response_text += f'\n\n💰 Cost: ${message.total_cost_usd:.4f}'
+                # Note: cost display removed (subscription-based)
 
     except Exception as e:
         logger.error(f'Error processing response: {e}')
@@ -480,14 +479,9 @@ async def _process_response(
     finally:
         session.is_processing = False
 
-    if tool_outputs:
-        tools_text = '\n'.join(tool_outputs[-10:])
-        if len(tool_outputs) > 10:
-            tools_text = f'...({len(tool_outputs) - 10} more)\n' + tools_text
-        await split_and_send(update, tools_text)
-
+    # Send any remaining text
     if response_text.strip():
-        await split_and_send(update, response_text)
+        await send_text(update, response_text)
 
 
 async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
