@@ -11,8 +11,9 @@ from glaude.settings import load_config, CONFIG_FILE
 
 @click.group(invoke_without_command=True)
 @click.option('--version', '-V', is_flag=True, help='Show version')
+@click.option('--reload', '-r', is_flag=True, help='Start server in reload mode (dev)')
 @click.pass_context
-def main(ctx: click.Context, version: bool) -> None:
+def main(ctx: click.Context, version: bool, reload: bool) -> None:
     """Glaude - Remote Claude Code control via Telegram.
 
     Run without arguments to start Claude Code with teleportation support.
@@ -23,7 +24,7 @@ def main(ctx: click.Context, version: bool) -> None:
 
     if ctx.invoked_subcommand is None:
         # Default action: run the wrapper
-        ctx.invoke(run)
+        ctx.invoke(run, reload=reload)
 
 
 @main.command()
@@ -36,7 +37,8 @@ def setup() -> None:
 
 @main.command()
 @click.option('--foreground', '-f', is_flag=True, help="Run in foreground (don't daemonize)")
-def serve(foreground: bool) -> None:
+@click.option('--reload', '-r', is_flag=True, help='Auto-reload on code changes (dev mode)')
+def serve(foreground: bool, reload: bool) -> None:
     """Start the glaude server (HTTP + Telegram bot)."""
     config = load_config()
 
@@ -44,15 +46,48 @@ def serve(foreground: bool) -> None:
         click.echo('Glaude is not configured. Run: glaude setup')
         sys.exit(1)
 
-    from glaude.server import run_server
+    if reload:
+        _serve_with_reload(config)
+    else:
+        from glaude.server import run_server
 
-    click.echo(f'Starting glaude server on {config.server.host}:{config.server.port}...')
-    asyncio.run(run_server(config))
+        click.echo(f'Starting glaude server on {config.server.host}:{config.server.port}...')
+        asyncio.run(run_server(config))
+
+
+def _run_server_subprocess():
+    """Target function for watchfiles - must be at module level for pickling."""
+    import subprocess
+
+    cmd = [sys.executable, '-m', 'glaude', 'serve']
+    subprocess.run(cmd)
+
+
+def _serve_with_reload(config) -> None:
+    """Run server with hot-reload on code changes."""
+    from pathlib import Path
+
+    import watchfiles
+
+    # Find the glaude package directory
+    glaude_dir = Path(__file__).parent
+
+    click.echo(f'Starting glaude server on {config.server.host}:{config.server.port} (reload mode)...')
+    click.echo(f'Watching: {glaude_dir}')
+
+    # Watch Python files in the glaude directory
+    watchfiles.run_process(
+        glaude_dir,
+        target=_run_server_subprocess,
+        watch_filter=watchfiles.PythonFilter(),
+        callback=lambda changes: click.echo(f'Reloading... (changed: {[str(c[1]) for c in changes]})'),
+    )
 
 
 @main.command()
+@click.option('--reload', '-r', is_flag=True, help='Start server in reload mode (dev)')
 @click.argument('args', nargs=-1)
-def run(args: tuple[str, ...]) -> None:
+def run(reload: bool, args: tuple[str, ...]) -> None:
     """Run Claude Code with teleportation support.
 
     Any arguments are passed through to Claude.
@@ -65,7 +100,7 @@ def run(args: tuple[str, ...]) -> None:
 
     from glaude.wrapper import run_claude_wrapper
 
-    sys.exit(run_claude_wrapper(config, list(args)))
+    sys.exit(run_claude_wrapper(config, list(args), reload=reload))
 
 
 @main.command()

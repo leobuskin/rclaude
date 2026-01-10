@@ -10,6 +10,7 @@ dependencies = [
     'aiohttp>=3.9',
     'tomli-w>=1.0',
     'pexpect>=4.9',
+    'watchfiles>=1.0',
 ]
 
 [project.scripts]

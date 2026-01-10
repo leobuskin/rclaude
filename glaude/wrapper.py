@@ -30,7 +30,7 @@ def is_server_running(config: Config) -> bool:
     return result == 0
 
 
-def start_server_background(config: Config) -> subprocess.Popen:
+def start_server_background(config: Config, reload: bool = False) -> subprocess.Popen:
     """Start the glaude server in the background."""
     # Find the glaude executable
     import shutil
@@ -41,16 +41,21 @@ def start_server_background(config: Config) -> subprocess.Popen:
     else:
         cmd = [sys.executable, '-m', 'glaude', 'serve']
 
+    if reload:
+        cmd.append('--reload')
+
     # Start in background
+    # In reload mode, keep stderr visible for debugging
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=None if reload else subprocess.DEVNULL,
         start_new_session=True,
     )
 
-    # Wait for server to be ready
-    for _ in range(50):  # 5 seconds timeout
+    # Wait for server to be ready (longer timeout for reload mode due to watchfiles startup)
+    timeout = 100 if reload else 50  # 10s vs 5s
+    for _ in range(timeout):
         if is_server_running(config):
             return proc
         time.sleep(0.1)
@@ -59,31 +64,34 @@ def start_server_background(config: Config) -> subprocess.Popen:
 
 
 def tail_session_log(session_id: str, cwd: str) -> None:
-    """Tail session log files to show updates.
-
-    If the original session is empty, Telegram may create a new session.
-    We watch all .jsonl files in the project directory.
-    """
+    """Tail the specific session log file to show updates."""
     project_path = cwd.replace('/', '-').replace(':', '')
     if project_path.startswith('-'):
         project_path = project_path[1:]
 
     log_dir = Path.home() / '.claude' / 'projects' / f'-{project_path}'
-
-    if not log_dir.exists():
-        print(f'Session log directory not found: {log_dir}')
-        return
+    log_file = log_dir / f'{session_id}.jsonl'
 
     print('\n📱 Session on Telegram. Showing live updates...')
-    print(f'   Directory: {log_dir}')
+    print(f'   Session: {session_id}')
     print('   Press Ctrl+C to exit.\n')
     print('─' * 60)
 
-    # Watch all jsonl files in the project directory
-    # This handles the case where Telegram creates a new session
+    # Wait for file to exist if needed
+    if not log_file.exists():
+        print('Waiting for session activity...')
+        for _ in range(30):  # 30 second timeout
+            time.sleep(1)
+            if log_file.exists():
+                break
+        if not log_file.exists():
+            print('No session activity detected.')
+            return
+
     try:
+        # Use -n 0 to only show NEW lines (skip existing content)
         with subprocess.Popen(
-            ['tail', '-f'] + [str(f) for f in log_dir.glob('*.jsonl')],
+            ['tail', '-f', '-n', '0', str(log_file)],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -118,16 +126,39 @@ def tail_session_log(session_id: str, cwd: str) -> None:
         print('\n\nExiting tail mode.')
 
 
-def run_claude_wrapper(config: Config, args: list[str]) -> int:
+def _stop_server(proc: subprocess.Popen) -> None:
+    """Stop the server process gracefully."""
+    print('\nStopping glaude server...')
+    try:
+        # First try graceful termination
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            # Force kill if still running
+            proc.kill()
+            proc.wait()
+        print('✓ Server stopped')
+    except Exception as e:
+        print(f'Warning: Could not stop server: {e}')
+
+
+def run_claude_wrapper(config: Config, args: list[str], reload: bool = False) -> int:
     """Run Claude Code with teleportation support.
 
     This spawns Claude as a subprocess and monitors for teleport signals.
     """
+    # Track server process if we start it
+    server_proc: subprocess.Popen | None = None
+
     # Ensure server is running
     if not is_server_running(config):
-        print('Starting glaude server...')
+        msg = 'Starting glaude server'
+        if reload:
+            msg += ' (reload mode)'
+        print(f'{msg}...')
         try:
-            start_server_background(config)
+            server_proc = start_server_background(config, reload=reload)
             print('✓ Server started')
         except RuntimeError as e:
             print(f'Warning: {e}')
@@ -196,6 +227,9 @@ def run_claude_wrapper(config: Config, args: list[str]) -> int:
             cwd = teleport_data.get('cwd', '.')
             signal_file.unlink(missing_ok=True)
             tail_session_log(session_id, cwd)
+            # Clean up server if we started it
+            if server_proc:
+                _stop_server(server_proc)
             return 0
 
         return child.exitstatus or 0
@@ -205,6 +239,8 @@ def run_claude_wrapper(config: Config, args: list[str]) -> int:
         return 1
     finally:
         signal_file.unlink(missing_ok=True)
+        # Note: We don't stop server here on normal exit
+        # Only stop when exiting tail mode (teleport completed)
 
 
 def run_claude_simple(config: Config, args: list[str]) -> int:
