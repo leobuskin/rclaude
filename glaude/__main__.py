@@ -1,12 +1,6 @@
 """Entry point for running glaude as a module."""
 
-from glaude.bot import run
-
-
-def main() -> None:
-    """Main entry point."""
-    run()
-
+from glaude.cli import main
 
 if __name__ == '__main__':
     main()
