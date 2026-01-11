@@ -30,7 +30,7 @@ def main(ctx: click.Context, version: bool, reload: bool, verbose: bool) -> None
 
     if ctx.invoked_subcommand is None:
         # Default action: run the wrapper
-        ctx.invoke(run, reload=reload)
+        ctx.invoke(run, reload=reload, verbose=verbose)
 
 
 @main.command()
@@ -44,8 +44,14 @@ def setup() -> None:
 @main.command()
 @click.option('--foreground', '-f', is_flag=True, help="Run in foreground (don't daemonize)")
 @click.option('--reload', '-r', is_flag=True, help='Auto-reload on code changes (dev mode)')
-def serve(foreground: bool, reload: bool) -> None:
+@click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
+def serve(foreground: bool, reload: bool, verbose: bool) -> None:
     """Start the glaude server (HTTP + Telegram bot)."""
+    if verbose:
+        import logging
+
+        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
     config = load_config()
 
     if not config.is_configured():
@@ -53,7 +59,7 @@ def serve(foreground: bool, reload: bool) -> None:
         sys.exit(1)
 
     if reload:
-        _serve_with_reload(config)
+        _serve_with_reload(config, verbose=verbose)
     else:
         from glaude.server import run_server
 
@@ -61,7 +67,7 @@ def serve(foreground: bool, reload: bool) -> None:
         asyncio.run(run_server(config))
 
 
-def _serve_with_reload(config) -> None:
+def _serve_with_reload(config, verbose: bool = False) -> None:
     """Run server with hot-reload on code changes.
 
     Uses graceful shutdown to preserve session state across restarts.
@@ -84,6 +90,8 @@ def _serve_with_reload(config) -> None:
     def start_server():
         nonlocal proc
         cmd = [sys.executable, '-m', 'glaude', 'serve']
+        if verbose:
+            cmd.append('--verbose')
         proc = subprocess.Popen(cmd)
         return proc
 
@@ -132,8 +140,9 @@ def _serve_with_reload(config) -> None:
 
 @main.command()
 @click.option('--reload', '-r', is_flag=True, help='Start server in reload mode (dev)')
+@click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
 @click.argument('args', nargs=-1)
-def run(reload: bool, args: tuple[str, ...]) -> None:
+def run(reload: bool, verbose: bool, args: tuple[str, ...]) -> None:
     """Run Claude Code with teleportation support.
 
     Any arguments are passed through to Claude.
@@ -146,7 +155,7 @@ def run(reload: bool, args: tuple[str, ...]) -> None:
 
     from glaude.wrapper import run_claude_wrapper
 
-    sys.exit(run_claude_wrapper(config, list(args), reload=reload))
+    sys.exit(run_claude_wrapper(config, list(args), reload=reload, verbose=verbose))
 
 
 @main.command()
@@ -239,7 +248,8 @@ def teleport_hook() -> None:
     if not is_server_running(config):
         try:
             reload_mode = os.environ.get('GLAUDE_RELOAD') == '1'
-            start_server_background(config, reload=reload_mode)
+            verbose_mode = os.environ.get('GLAUDE_VERBOSE') == '1'
+            start_server_background(config, reload=reload_mode, verbose=verbose_mode)
         except RuntimeError as e:
             click.echo(f'Error: Failed to start server - {e}', err=True)
             sys.exit(1)
