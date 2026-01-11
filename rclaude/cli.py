@@ -240,6 +240,7 @@ def teleport_hook() -> None:
     session_id = hook_input.get('session_id')
     cwd = hook_input.get('cwd', '.')
     prompt = hook_input.get('prompt', '')
+    permission_mode = hook_input.get('permission_mode', 'default')
 
     if not session_id:
         click.echo('Error: No session_id in hook input', err=True)
@@ -271,7 +272,7 @@ def teleport_hook() -> None:
 
     # POST to teleport endpoint
     url = f'http://{config.server.host}:{config.server.port}/teleport'
-    data = json.dumps({'session_id': session_id, 'cwd': cwd}).encode()
+    data = json.dumps({'session_id': session_id, 'cwd': cwd, 'permission_mode': permission_mode}).encode()
 
     try:
         req = urllib.request.Request(

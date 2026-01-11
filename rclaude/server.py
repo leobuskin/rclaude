@@ -8,7 +8,7 @@ import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, cast
 
 from aiohttp import web
 from telegram import Update, Bot
@@ -37,6 +37,7 @@ from rclaude.session import (
     PendingPermission,
     UserSession,
     SessionUpdate,
+    PermissionMode,
     save_session_state,
     load_session_state,
     clear_session_state,
@@ -48,6 +49,8 @@ from rclaude.formatting import (
     create_question_keyboard,
     format_permission_prompt,
     create_permission_keyboard,
+    create_mode_keyboard,
+    create_model_keyboard,
 )
 
 
@@ -140,8 +143,46 @@ async def dummy_pretool_hook(
 # Permission System
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Tools that require interactive approval
+# Permission mode display names
+MODE_DISPLAY = {
+    'default': '🔒 Default (ask for permissions)',
+    'acceptEdits': '📝 Accept Edits (auto-allow file changes)',
+    'plan': '📋 Plan Mode (read-only)',
+    'bypassPermissions': '⚠️ Dangerous (skip all permissions)',
+}
+
+
+def _format_mode_display(mode: str) -> str:
+    """Format permission mode for display."""
+    return MODE_DISPLAY.get(mode, f'🔒 {mode}')
+
+
+VALID_MODES = ('default', 'acceptEdits', 'plan', 'bypassPermissions')
+
+
+def _validate_permission_mode(mode: str) -> str:
+    """Validate and return a permission mode, defaulting to 'default' if invalid."""
+    if mode in VALID_MODES:
+        return mode
+    return 'default'
+
+
+def _format_mode_short(mode: str) -> str:
+    """Format permission mode as short label."""
+    short = {
+        'default': '🔒',
+        'acceptEdits': '📝',
+        'plan': '📋',
+        'bypassPermissions': '⚠️',
+    }
+    return short.get(mode, '🔒')
+
+
+# Tools that require interactive approval in default mode
 APPROVAL_REQUIRED_TOOLS = {'Edit', 'Write', 'Bash', 'NotebookEdit'}
+
+# Edit tools that are auto-allowed in acceptEdits mode
+EDIT_TOOLS = {'Edit', 'Write', 'NotebookEdit', 'MultiEdit'}
 
 
 def generate_permission_rule(tool_name: str, input_data: dict[str, Any]) -> str:
@@ -162,6 +203,41 @@ def generate_permission_rule(tool_name: str, input_data: dict[str, Any]) -> str:
         return f'NotebookEdit(//{notebook_path})'
     else:
         return f'{tool_name}(*)'
+
+
+def load_permission_rules(cwd: str) -> list[str]:
+    """Load allow rules from .claude/settings.local.json."""
+    settings_path = Path(cwd) / '.claude' / 'settings.local.json'
+    if not settings_path.exists():
+        return []
+    try:
+        settings = json.loads(settings_path.read_text())
+        return settings.get('permissions', {}).get('allow', [])
+    except (json.JSONDecodeError, KeyError):
+        return []
+
+
+def check_permission_rule(tool_name: str, input_data: dict[str, Any], rules: list[str]) -> bool:
+    """Check if a tool call matches any allow rule."""
+    # Generate the rule that would match this tool call
+    generated_rule = generate_permission_rule(tool_name, input_data)
+
+    # Check exact match first
+    if generated_rule in rules:
+        return True
+
+    # For Bash commands, also check wildcard patterns
+    if tool_name == 'Bash':
+        command = input_data.get('command', '')
+        base_cmd = command.split()[0] if command else ''
+        # Check Bash(cmd:*) pattern
+        if f'Bash({base_cmd}:*)' in rules:
+            return True
+        # Check Bash(*) pattern (all bash commands)
+        if 'Bash(*)' in rules:
+            return True
+
+    return False
 
 
 async def add_permission_rule(cwd: str, tool_name: str, input_data: dict[str, Any]) -> None:
@@ -204,10 +280,26 @@ def create_permission_handler(
         context: ToolPermissionContext,
     ) -> PermissionResultAllow | PermissionResultDeny:
         """Handle tool permission requests via Telegram."""
-        logger.info(f'[PERMISSION] can_use_tool called: tool={tool_name}')
-        # Auto-allow tools that don't need approval
+        logger.info(f'[PERMISSION] can_use_tool called: tool={tool_name}, mode={session.permission_mode}')
+
+        # Check permission mode first
+        if session.permission_mode == 'bypassPermissions':
+            logger.info(f'[PERMISSION] Auto-allowing {tool_name} (bypass mode)')
+            return PermissionResultAllow(updated_input=input_data)
+
+        if session.permission_mode == 'acceptEdits' and tool_name in EDIT_TOOLS:
+            logger.info(f'[PERMISSION] Auto-allowing {tool_name} (acceptEdits mode)')
+            return PermissionResultAllow(updated_input=input_data)
+
+        # Auto-allow tools that don't need approval in default mode
         if tool_name not in APPROVAL_REQUIRED_TOOLS:
             logger.info(f'[PERMISSION] Auto-allowing {tool_name} (not in approval list)')
+            return PermissionResultAllow(updated_input=input_data)
+
+        # Check if a saved rule allows this tool
+        rules = load_permission_rules(session.cwd)
+        if check_permission_rule(tool_name, input_data, rules):
+            logger.info(f'[PERMISSION] Auto-allowing {tool_name} (matches saved rule)')
             return PermissionResultAllow(updated_input=input_data)
 
         # Create pending permission request
@@ -222,7 +314,7 @@ def create_permission_handler(
 
         # Format and send the permission prompt
         text = format_permission_prompt(tool_name, input_data)
-        keyboard = create_permission_keyboard()
+        keyboard = create_permission_keyboard(tool_name)
 
         try:
             await bot.send_message(
@@ -300,6 +392,7 @@ class TeleportRequest:
 
     session_id: str
     cwd: str
+    permission_mode: str = 'default'
 
 
 @dataclass
@@ -327,6 +420,7 @@ async def handle_teleport(request: web.Request) -> web.Response:
 
     session_id = data.get('session_id')
     cwd = data.get('cwd', '.')
+    permission_mode = data.get('permission_mode', 'default')
 
     if not session_id:
         return web.json_response({'error': 'session_id required'}, status=400)
@@ -338,19 +432,21 @@ async def handle_teleport(request: web.Request) -> web.Response:
     if not user_id:
         return web.json_response({'error': 'No Telegram user configured'}, status=400)
 
-    logger.info(f'Teleport received: session_id={session_id[:8]}..., cwd={cwd}')
+    logger.info(f'Teleport received: session_id={session_id[:8]}..., cwd={cwd}, mode={permission_mode}')
 
     # Store pending teleport
-    _pending_teleports[user_id] = TeleportRequest(session_id=session_id, cwd=cwd)
+    _pending_teleports[user_id] = TeleportRequest(session_id=session_id, cwd=cwd, permission_mode=permission_mode)
 
     # Notify via Telegram
     bot = request.app['telegram_app'].bot
+    mode_display = _format_mode_display(permission_mode)
     try:
         await bot.send_message(
             chat_id=user_id,
             text=f'📱 Session teleported from terminal!\n\n'
             f'Session: `{session_id[:8]}...`\n'
-            f'Directory: `{cwd}`\n\n'
+            f'Directory: `{cwd}`\n'
+            f'Mode: {mode_display}\n\n'
             f'Send any message to continue, or /cancel to ignore.',
             parse_mode='Markdown',
         )
@@ -534,8 +630,11 @@ async def tg_handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         'Commands:\n'
         '/start - Show this help\n'
         '/new - Start a new session\n'
-        '/cc - Get command to return to terminal\n'
+        '/cc - Return to terminal\n'
         '/status - Show session status\n'
+        '/mode - Change permission mode\n'
+        '/model - Change AI model\n'
+        '/cost - Show usage and cost\n'
         '/stop - Interrupt current task\n\n'
         'Or just send a message to interact with Claude.'
     )
@@ -611,10 +710,12 @@ async def tg_handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     session = get_session(update.effective_user.id)
 
+    mode_short = _format_mode_short(session.permission_mode)
     status_lines = [
         f'Working directory: `{session.cwd}`',
         f'Session active: {"Yes" if session.client else "No"}',
         f'Processing: {"Yes" if session.is_processing else "No"}',
+        f'Mode: {mode_short} {session.permission_mode}',
     ]
 
     if update.effective_user.id in _pending_teleports:
@@ -622,6 +723,134 @@ async def tg_handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         status_lines.append(f'Pending teleport: `{tp.session_id[:8]}...`')
 
     await update.message.reply_text('\n'.join(status_lines), parse_mode='Markdown')
+
+
+async def tg_handle_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /mode command - show and switch permission modes."""
+    assert update.effective_user
+    assert update.message
+
+    config: Config = context.bot_data['config']
+    if update.effective_user.id != config.telegram.user_id:
+        return
+
+    session = get_session(update.effective_user.id)
+
+    # Check for argument: /mode default, /mode accept, etc
+    text = update.message.text or ''
+    parts = text.split(maxsplit=1)
+    if len(parts) > 1:
+        mode_arg = parts[1].strip().lower()
+        mode_map = {
+            'default': 'default',
+            'accept': 'acceptEdits',
+            'acceptedits': 'acceptEdits',
+            'plan': 'plan',
+            'dangerous': 'bypassPermissions',
+            'bypass': 'bypassPermissions',
+        }
+        new_mode = mode_map.get(mode_arg)
+        if new_mode:
+            session.permission_mode = cast(PermissionMode, new_mode)
+            await update.message.reply_text(
+                f'✓ Mode changed to: {_format_mode_display(new_mode)}',
+                parse_mode='HTML',
+            )
+            return
+        else:
+            await update.message.reply_text(
+                f'Unknown mode: {mode_arg}\n\nValid modes: default, accept, plan, dangerous'
+            )
+            return
+
+    # No argument - show current mode with keyboard
+    keyboard = create_mode_keyboard(session.permission_mode)
+    await update.message.reply_text(
+        f'<b>Permission Mode</b>\n\nCurrent: {_format_mode_display(session.permission_mode)}\n\n'
+        f'<i>Select a new mode below:</i>',
+        parse_mode='HTML',
+        reply_markup=keyboard,
+    )
+
+
+async def tg_handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /model command - show and switch AI models."""
+    assert update.effective_user
+    assert update.message
+
+    config: Config = context.bot_data['config']
+    if update.effective_user.id != config.telegram.user_id:
+        return
+
+    session = get_session(update.effective_user.id)
+
+    # Check for argument: /model sonnet, /model opus, etc
+    text = update.message.text or ''
+    parts = text.split(maxsplit=1)
+    if len(parts) > 1:
+        model_arg = parts[1].strip().lower()
+        model_map = {
+            'sonnet': 'sonnet',
+            'opus': 'opus',
+            'haiku': 'haiku',
+        }
+        new_model = model_map.get(model_arg, model_arg)  # Allow full model names too
+
+        if session.client:
+            try:
+                await session.client.set_model(new_model)
+                session.current_model = new_model
+                await update.message.reply_text(f'✓ Model changed to: <b>{new_model}</b>', parse_mode='HTML')
+            except Exception as e:
+                await update.message.reply_text(f'Failed to change model: {e}')
+        else:
+            session.current_model = new_model
+            await update.message.reply_text(
+                f'✓ Model set to: <b>{new_model}</b>\n<i>(Will apply on next session)</i>',
+                parse_mode='HTML',
+            )
+        return
+
+    # No argument - show current model with keyboard
+    keyboard = create_model_keyboard(session.current_model)
+    current = session.current_model or 'default (sonnet)'
+    await update.message.reply_text(
+        f'<b>AI Model</b>\n\nCurrent: <b>{current}</b>\n\n'
+        '<i>Select a model below:</i>',
+        parse_mode='HTML',
+        reply_markup=keyboard,
+    )
+
+
+async def tg_handle_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /cost command - show session cost and usage."""
+    assert update.effective_user
+    assert update.message
+
+    config: Config = context.bot_data['config']
+    if update.effective_user.id != config.telegram.user_id:
+        return
+
+    session = get_session(update.effective_user.id)
+    usage = session.usage
+
+    lines = ['<b>Session Usage</b>\n']
+
+    if usage.total_cost_usd > 0:
+        lines.append(f'💰 Total cost: <b>${usage.total_cost_usd:.4f}</b>')
+    else:
+        lines.append('💰 Total cost: <i>Not available</i>')
+
+    lines.append(f'📊 Turns: {usage.num_turns}')
+
+    if usage.total_input_tokens > 0 or usage.total_output_tokens > 0:
+        lines.append(f'📥 Input tokens: {usage.total_input_tokens:,}')
+        lines.append(f'📤 Output tokens: {usage.total_output_tokens:,}')
+
+    if usage.last_response_cost is not None:
+        lines.append(f'\n<i>Last response: ${usage.last_response_cost:.4f}</i>')
+
+    await update.message.reply_text('\n'.join(lines), parse_mode='HTML')
 
 
 async def tg_handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -729,6 +958,18 @@ async def tg_handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _handle_question_callback(update, context, session, data)
         return
 
+    # Handle mode selection callbacks
+    if data.startswith('mode:'):
+        logger.info('[CALLBACK] Handling mode callback')
+        await _handle_mode_callback(update, context, session, data)
+        return
+
+    # Handle model selection callbacks
+    if data.startswith('model:'):
+        logger.info('[CALLBACK] Handling model callback')
+        await _handle_model_callback(update, context, session, data)
+        return
+
     logger.warning(f'[CALLBACK] Unknown callback data: {data}')
 
 
@@ -767,6 +1008,17 @@ async def _handle_permission_callback(
         rule = generate_permission_rule(pending.tool_name, pending.input_data)
         await query.edit_message_text(f'✓ Allowed (always)\n<code>{rule}</code>', parse_mode='HTML')
         logger.info('[PERM_CALLBACK] Setting event for always-allow')
+        pending.event.set()
+
+    elif action == 'accept_edits':
+        # Enable acceptEdits mode and allow this tool
+        session.permission_mode = cast(PermissionMode, 'acceptEdits')
+        pending.result = PermissionResultAllow(updated_input=pending.input_data)
+        await query.edit_message_text(
+            '✓ Allowed\n\n📝 <b>Accept Edits mode enabled</b>\nFile changes will be auto-approved.',
+            parse_mode='HTML',
+        )
+        logger.info('[PERM_CALLBACK] Enabled acceptEdits mode')
         pending.event.set()
 
     elif action == 'reject':
@@ -840,6 +1092,57 @@ async def _continue_after_question(
     if session.client:
         await session.client.query(answer_text)
         await _process_response(update, context, session)
+
+
+async def _handle_mode_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: UserSession,
+    data: str,
+) -> None:
+    """Handle mode selection inline keyboard callbacks."""
+    assert update.callback_query
+    query = update.callback_query
+
+    # Extract mode from callback data: "mode:default", "mode:acceptEdits", etc
+    mode = data.split(':', 1)[1]
+    if mode not in VALID_MODES:
+        await query.edit_message_text(f'Unknown mode: {mode}')
+        return
+
+    session.permission_mode = cast(PermissionMode, mode)
+    await query.edit_message_text(
+        f'✓ Mode changed to: {_format_mode_display(mode)}',
+        parse_mode='HTML',
+    )
+
+
+async def _handle_model_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: UserSession,
+    data: str,
+) -> None:
+    """Handle model selection inline keyboard callbacks."""
+    assert update.callback_query
+    query = update.callback_query
+
+    # Extract model from callback data: "model:sonnet", "model:opus", etc
+    model = data.split(':', 1)[1]
+
+    if session.client:
+        try:
+            await session.client.set_model(model)
+            session.current_model = model
+            await query.edit_message_text(f'✓ Model changed to: <b>{model}</b>', parse_mode='HTML')
+        except Exception as e:
+            await query.edit_message_text(f'Failed to change model: {e}')
+    else:
+        session.current_model = model
+        await query.edit_message_text(
+            f'✓ Model set to: <b>{model}</b>\n<i>(Will apply on next session)</i>',
+            parse_mode='HTML',
+        )
 
 
 async def _process_response(
@@ -917,6 +1220,17 @@ async def _process_response(
                     session.session_id = message.session_id
                     logger.info(f'[SESSION] Captured session_id from ResultMessage: {message.session_id[:8]}...')
 
+                # Track usage and cost
+                session.usage.num_turns += message.num_turns
+                if message.total_cost_usd is not None:
+                    session.usage.last_response_cost = message.total_cost_usd
+                    session.usage.total_cost_usd += message.total_cost_usd
+                if message.usage:
+                    session.usage.last_response_tokens = message.usage
+                    session.usage.total_input_tokens += message.usage.get('input_tokens', 0)
+                    session.usage.total_output_tokens += message.usage.get('output_tokens', 0)
+                logger.info(f'[USAGE] Cost: ${message.total_cost_usd or 0:.4f}, Total: ${session.usage.total_cost_usd:.4f}')
+
     except Exception as e:
         logger.error(f'Error processing response: {e}')
         response_text += f'\n\n❌ Error: {e}'
@@ -952,6 +1266,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if user_id in _pending_teleports:
         teleport = _pending_teleports.pop(user_id)
         session.cwd = teleport.cwd
+        session.permission_mode = cast(PermissionMode, _validate_permission_mode(teleport.permission_mode))
 
         # Check if we can resume the session (has conversation history)
         resumable = can_resume_session(teleport.session_id, teleport.cwd)
@@ -969,7 +1284,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 # Don't pass tools - defaults to all tools available (like CLI)
                 # Don't use allowed_tools - it creates permission ALLOW rules that bypass can_use_tool!
                 setting_sources=['user', 'project', 'local'],  # Load CC permission rules
-                permission_mode='default',  # Use default mode - SDK handles via can_use_tool
+                permission_mode=session.permission_mode,  # Use teleported mode
                 can_use_tool=permission_handler,  # Interactive approval via Telegram
                 cwd=session.cwd,
                 resume=resume_id,
@@ -989,7 +1304,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     logger.warning(f'[DEBUG] Resume failed, trying fresh session: {connect_err}')
                     options = ClaudeAgentOptions(
                         setting_sources=['user', 'project', 'local'],
-                        permission_mode='default',
+                        permission_mode=session.permission_mode,
                         can_use_tool=permission_handler,
                         cwd=session.cwd,
                         resume=None,  # Fresh session
@@ -1003,10 +1318,22 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 else:
                     raise
 
+            # Send session start message with mode info
+            mode_display = _format_mode_display(session.permission_mode)
             if resumable:
-                await update.message.reply_text('✓ Session resumed. Continuing...')
+                start_msg = f'✓ Session resumed\nMode: {mode_display}'
             else:
-                await update.message.reply_text('✓ Connected. Starting fresh session.')
+                start_msg = f'✓ Connected (fresh session)\nMode: {mode_display}'
+            await update.message.reply_text(start_msg, parse_mode='HTML')
+
+            # Send and pin meta-message with session info (if not default mode)
+            if session.permission_mode != 'default':
+                meta_text = f'{_format_mode_short(session.permission_mode)} <b>{session.permission_mode}</b> mode active'
+                try:
+                    meta_msg = await update.message.reply_text(meta_text, parse_mode='HTML')
+                    await meta_msg.pin(disable_notification=True)
+                except Exception as pin_err:
+                    logger.warning(f'Failed to pin meta message: {pin_err}')
         except Exception as e:
             logger.error(f'[DEBUG] Teleport failed: {e}')
             await update.message.reply_text(f'Failed to connect: {e}')
@@ -1128,6 +1455,9 @@ def create_telegram_app(config: Config) -> Application:
     app.add_handler(CommandHandler('new', tg_handle_new))
     app.add_handler(CommandHandler('cc', tg_handle_cc))
     app.add_handler(CommandHandler('status', tg_handle_status))
+    app.add_handler(CommandHandler('mode', tg_handle_mode))
+    app.add_handler(CommandHandler('model', tg_handle_model))
+    app.add_handler(CommandHandler('cost', tg_handle_cost))
     app.add_handler(CommandHandler('stop', tg_handle_stop))
     app.add_handler(CommandHandler('cancel', tg_handle_cancel))
     app.add_handler(CommandHandler('link', tg_handle_link))

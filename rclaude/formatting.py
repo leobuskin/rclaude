@@ -382,14 +382,66 @@ def format_permission_prompt(tool_name: str, input_data: dict[str, Any]) -> str:
         return f'<b>🔧 {escape_html(tool_name)}</b>\n\n<pre>{escape_html(json.dumps(input_data, indent=2)[:1000])}</pre>'
 
 
-def create_permission_keyboard() -> InlineKeyboardMarkup:
-    """Create inline keyboard for permission approval."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton('✓ Allow', callback_data='perm:allow'),
-            InlineKeyboardButton('✓ Always', callback_data='perm:always'),
-        ],
-        [
-            InlineKeyboardButton('✗ Reject', callback_data='perm:reject'),
-        ],
-    ])
+def create_permission_keyboard(tool_name: str | None = None) -> InlineKeyboardMarkup:
+    """Create inline keyboard for permission approval.
+
+    For edit tools (Edit, Write, NotebookEdit), shows 'Accept Edits' instead of 'Always'.
+    """
+    edit_tools = {'Edit', 'Write', 'NotebookEdit', 'MultiEdit'}
+
+    if tool_name and tool_name in edit_tools:
+        # For edit tools, offer to enable acceptEdits mode
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton('✓ Allow', callback_data='perm:allow'),
+                InlineKeyboardButton('📝 Accept Edits', callback_data='perm:accept_edits'),
+            ],
+            [
+                InlineKeyboardButton('✗ Reject', callback_data='perm:reject'),
+            ],
+        ])
+    else:
+        # For other tools (Bash, etc.), offer to add rule to settings
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton('✓ Allow', callback_data='perm:allow'),
+                InlineKeyboardButton('✓ Always', callback_data='perm:always'),
+            ],
+            [
+                InlineKeyboardButton('✗ Reject', callback_data='perm:reject'),
+            ],
+        ])
+
+
+def create_mode_keyboard(current_mode: str) -> InlineKeyboardMarkup:
+    """Create inline keyboard for mode selection."""
+    modes = [
+        ('default', '🔒 Default'),
+        ('acceptEdits', '📝 Accept Edits'),
+        ('plan', '📋 Plan Mode'),
+        ('bypassPermissions', '⚠️ Dangerous'),
+    ]
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for mode_id, label in modes:
+        if mode_id == current_mode:
+            label = f'• {label}'  # Mark current
+        buttons.append([InlineKeyboardButton(label, callback_data=f'mode:{mode_id}')])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def create_model_keyboard(current_model: str | None = None) -> InlineKeyboardMarkup:
+    """Create inline keyboard for model selection."""
+    models = [
+        ('sonnet', '⚡ Sonnet', 'Fast, balanced'),
+        ('opus', '🧠 Opus', 'Most capable'),
+        ('haiku', '🚀 Haiku', 'Fastest, lightweight'),
+    ]
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    for model_id, label, desc in models:
+        display = f'• {label}' if current_model and model_id in current_model.lower() else label
+        buttons.append([InlineKeyboardButton(f'{display} - {desc}', callback_data=f'model:{model_id}')])
+
+    return InlineKeyboardMarkup(buttons)

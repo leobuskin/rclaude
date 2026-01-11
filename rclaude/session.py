@@ -5,9 +5,12 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from claude_agent_sdk import ClaudeSDKClient
+
+# Permission modes matching Claude Code CLI
+PermissionMode = Literal['default', 'acceptEdits', 'plan', 'bypassPermissions']
 
 # File to persist session state across hot-reloads
 SESSION_STATE_FILE = Path('/tmp/rclaude-session-state.json')
@@ -43,6 +46,18 @@ class SessionUpdate:
 
 
 @dataclass
+class SessionUsage:
+    """Tracks usage and cost for a session."""
+
+    total_cost_usd: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    num_turns: int = 0
+    last_response_cost: float | None = None
+    last_response_tokens: dict[str, Any] | None = None
+
+
+@dataclass
 class UserSession:
     """Manages a user's Claude session state."""
 
@@ -53,6 +68,9 @@ class UserSession:
     waiting_for_rejection_reason: bool = False
     cwd: str = field(default_factory=os.getcwd)
     session_id: str | None = None  # Track current session ID for /cc
+    permission_mode: PermissionMode = 'default'  # Current permission mode
+    current_model: str | None = None  # Current model (sonnet, opus, haiku, or full name)
+    usage: SessionUsage = field(default_factory=SessionUsage)  # Cost/usage tracking
     # Queue for streaming updates to terminal
     update_queue: asyncio.Queue[SessionUpdate] = field(default_factory=asyncio.Queue)
 
@@ -86,6 +104,7 @@ def save_session_state() -> None:
                 'session_id': session.session_id,
                 'cwd': session.cwd,
                 'is_processing': session.is_processing,
+                'permission_mode': session.permission_mode,
             }
     if state:
         SESSION_STATE_FILE.write_text(json.dumps(state))
