@@ -782,6 +782,8 @@ async def _process_response(
 
     session.is_processing = True
     response_text = ''
+    # Track tool call messages for editing with results: tool_use_id -> (message_id, text)
+    tool_messages: dict[str, tuple[int, str]] = {}
 
     try:
         async for message in session.client.receive_response():
@@ -816,8 +818,10 @@ async def _process_response(
                                 session.is_processing = False
                                 return
 
-                        # Send tool call as formatted message
-                        await send_tool_call(update, block)
+                        # Send tool call as formatted message and track for result editing
+                        msg_info = await send_tool_call(update, block)
+                        if msg_info and block.id:
+                            tool_messages[block.id] = msg_info
                         tool_desc = (
                             f'{block.name}: {block.input.get("command", block.input.get("file_path", block.input.get("pattern", "")))}'
                         )
@@ -827,7 +831,9 @@ async def _process_response(
                 # Tool results come in UserMessage
                 for block in message.content:
                     if isinstance(block, ToolResultBlock):
-                        await send_tool_result(update, block)
+                        # Find the original tool call message to edit
+                        msg_info = tool_messages.get(block.tool_use_id)
+                        await send_tool_result(update, block, msg_info)
                         # Don't send full tool results to terminal (too verbose)
 
             elif isinstance(message, ResultMessage):

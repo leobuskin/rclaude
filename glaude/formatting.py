@@ -113,10 +113,8 @@ async def send_text(update: Update, text: str) -> None:
                     logger.error(f'Failed to send plain message: {e2}')
 
 
-async def send_tool_call(update: Update, block: ToolUseBlock) -> None:
-    """Send a tool call as a formatted message."""
-    assert update.effective_chat
-
+def format_tool_call(block: ToolUseBlock) -> str | None:
+    """Format a tool call for display. Returns None for AskUserQuestion (handled specially)."""
     tool_name = block.name
     tool_input: dict[str, Any] = block.input
 
@@ -124,50 +122,59 @@ async def send_tool_call(update: Update, block: ToolUseBlock) -> None:
         cmd = tool_input.get('command', '')
         escaped_cmd = escape_html(cmd)
         if '\n' in cmd:
-            text = f'<pre><code class="language-bash">{escaped_cmd}</code></pre>'
+            return f'<pre><code class="language-bash">{escaped_cmd}</code></pre>'
         else:
-            text = f'<b>$</b> <code>{escaped_cmd}</code>'
+            return f'<b>$</b> <code>{escaped_cmd}</code>'
     elif tool_name == 'Read':
         path = escape_html(tool_input.get('file_path', ''))
-        text = f'📖 <b>Reading</b> <code>{path}</code>'
+        return f'📖 <b>Reading</b> <code>{path}</code>'
     elif tool_name == 'Write':
         path = escape_html(tool_input.get('file_path', ''))
-        text = f'📝 <b>Writing</b> <code>{path}</code>'
+        return f'📝 <b>Writing</b> <code>{path}</code>'
     elif tool_name == 'Edit':
         path = escape_html(tool_input.get('file_path', ''))
-        text = f'✏️ <b>Editing</b> <code>{path}</code>'
+        return f'✏️ <b>Editing</b> <code>{path}</code>'
     elif tool_name == 'Glob':
         pattern = escape_html(tool_input.get('pattern', ''))
-        text = f'🔍 <b>Finding</b> <code>{pattern}</code>'
+        return f'🔍 <b>Finding</b> <code>{pattern}</code>'
     elif tool_name == 'Grep':
         pattern = escape_html(tool_input.get('pattern', ''))
-        text = f'🔎 <b>Searching</b> <code>{pattern}</code>'
+        return f'🔎 <b>Searching</b> <code>{pattern}</code>'
     elif tool_name == 'Task':
         desc = escape_html(tool_input.get('description', ''))
-        text = f'🤖 <b>Subagent:</b> {desc}'
+        return f'🤖 <b>Subagent:</b> {desc}'
     elif tool_name == 'WebFetch':
         url = escape_html(tool_input.get('url', ''))
-        text = f'🌐 <b>Fetching</b> <code>{url}</code>'
+        return f'🌐 <b>Fetching</b> <code>{url}</code>'
     elif tool_name == 'WebSearch':
         query = escape_html(tool_input.get('query', ''))
-        text = f'🔍 <b>Web search:</b> {query}'
+        return f'🔍 <b>Web search:</b> {query}'
     elif tool_name == 'TodoWrite':
-        text = '📋 <b>Updating todos</b>'
+        return '📋 <b>Updating todos</b>'
     elif tool_name == 'AskUserQuestion':
-        return  # Handled specially
+        return None  # Handled specially
     else:
-        text = f'🔧 <b>{escape_html(tool_name)}</b>'
-
-    try:
-        await update.effective_chat.send_message(text, parse_mode='HTML')
-    except Exception as e:
-        logger.error(f'Failed to send tool call: {e}')
+        return f'🔧 <b>{escape_html(tool_name)}</b>'
 
 
-async def send_tool_result(update: Update, block: ToolResultBlock) -> None:
-    """Send a tool result as an expandable quote."""
+async def send_tool_call(update: Update, block: ToolUseBlock) -> tuple[int, str] | None:
+    """Send a tool call as a formatted message. Returns (message_id, text) for later editing."""
     assert update.effective_chat
 
+    text = format_tool_call(block)
+    if text is None:
+        return None
+
+    try:
+        msg = await update.effective_chat.send_message(text, parse_mode='HTML')
+        return (msg.message_id, text)
+    except Exception as e:
+        logger.error(f'Failed to send tool call: {e}')
+        return None
+
+
+def format_tool_result(block: ToolResultBlock) -> str | None:
+    """Format a tool result for display. Returns None if empty."""
     content = block.content
     if isinstance(content, str):
         result_text = content
@@ -181,31 +188,77 @@ async def send_tool_result(update: Update, block: ToolResultBlock) -> None:
         result_text = str(content) if content else ''
 
     if not result_text.strip():
-        return
+        return None
 
     # Truncate very long results
     if len(result_text) > 2000:
         result_text = result_text[:2000] + '\n...(truncated)'
 
     escaped = escape_html(result_text)
-    icon = '❌' if block.is_error else '✅'
 
-    # Use expandable blockquote for long/multiline results, inline for short single-line
+    # Use expandable blockquote for long/multiline results (no icon - looks cleaner)
+    # Only show icon for errors or short inline results
     if '\n' in result_text or len(result_text) > 200:
-        if len(result_text) > 200:
-            text = f'{icon} <blockquote expandable>{escaped}</blockquote>'
+        if block.is_error:
+            prefix = '❌ '
         else:
-            text = f'{icon} <blockquote>{escaped}</blockquote>'
+            prefix = ''
+        if len(result_text) > 200:
+            return f'{prefix}<blockquote expandable>{escaped}</blockquote>'
+        else:
+            return f'{prefix}<blockquote>{escaped}</blockquote>'
     else:
-        text = f'{icon} {escaped}'
+        # Short inline result - show icon
+        icon = '❌' if block.is_error else '✅'
+        return f'{icon} {escaped}'
 
+
+async def send_tool_result(
+    update: Update,
+    block: ToolResultBlock,
+    tool_msg_info: tuple[int, str] | None = None,
+) -> None:
+    """Send/update a tool result. If tool_msg_info provided, edit the original message."""
+    assert update.effective_chat
+
+    result_text = format_tool_result(block)
+    if result_text is None:
+        return
+
+    message_id = tool_msg_info[0] if tool_msg_info else None
+
+    # If we have the original tool call message, edit it to append the result
+    if tool_msg_info:
+        original_text = tool_msg_info[1]
+        combined_text = f'{original_text}\n{result_text}'
+        try:
+            bot = update.get_bot()
+            await bot.edit_message_text(
+                text=combined_text,
+                chat_id=update.effective_chat.id,
+                message_id=message_id,
+                parse_mode='HTML',
+            )
+            return
+        except Exception as e:
+            logger.error(f'Failed to edit tool message: {e}')
+            # Fall through to reply instead
+
+    # Fallback: reply to original message (or send standalone if no original)
     try:
-        await update.effective_chat.send_message(text, parse_mode='HTML')
+        await update.effective_chat.send_message(
+            result_text,
+            parse_mode='HTML',
+            reply_to_message_id=message_id,
+        )
     except Exception as e:
         logger.error(f'Failed to send tool result: {e}')
-        # Fallback without formatting
+        # Last resort: plain text without reply
+        icon = '❌' if block.is_error else '✅'
         try:
-            await update.effective_chat.send_message(f'{icon} {result_text[:1000]}')
+            content = block.content
+            plain = str(content)[:1000] if content else ''
+            await update.effective_chat.send_message(f'{icon} {plain}')
         except Exception:
             pass
 
