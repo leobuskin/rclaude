@@ -468,3 +468,19 @@ def create_model_keyboard(current_model: str | None = None) -> InlineKeyboardMar
         buttons.append([InlineKeyboardButton(f'{display} - {desc}', callback_data=f'model:{model_id}')])
 
     return InlineKeyboardMarkup(buttons)
+
+
+def format_image_analysis_summary(file_size: int, image_count: int = 1) -> str:
+    """Format a summary of image analysis for display."""
+    size_kb = file_size / 1024
+    if size_kb < 1:
+        size_str = f'{file_size} bytes'
+    elif size_kb < 1024:
+        size_str = f'{size_kb:.1f} KB'
+    else:
+        size_str = f'{size_kb / 1024:.1f} MB'
+
+    if image_count == 1:
+        return f'📸 Analyzed image ({size_str})'
+    else:
+        return f'📸 Analyzed {image_count} images ({size_str})'
