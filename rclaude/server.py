@@ -34,6 +34,11 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import HookInput, HookContext, SyncHookJSONOutput
 
 from rclaude.settings import Config
+from rclaude.image_handler import (
+    download_telegram_photo,
+    prepare_image_for_claude,
+    cleanup_image_file,
+)
 from rclaude.session import (
     get_session,
     PendingQuestion,
@@ -1322,6 +1327,76 @@ async def _handle_model_callback(
         )
 
 
+async def _handle_message_with_image(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: UserSession,
+    caption_text: str,
+) -> None:
+    """Handle a message with photo - download, encode, and send to Claude."""
+    assert update.message
+    assert update.effective_user
+    assert session.client
+
+    user_id = update.effective_user.id
+    image_path: Path | None = None
+
+    if not update.message.photo:
+        logger.error('[IMAGE] No photo in message despite has_photo flag')
+        await update.message.reply_text('❌ No image found')
+        return
+
+    try:
+        # Show processing indicator
+        await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
+
+        # Download image from Telegram
+        logger.info('[IMAGE] Downloading photo from Telegram...')
+        image_path = await download_telegram_photo(context.bot, update.message.photo, user_id)
+
+        if not image_path:
+            await update.message.reply_text('❌ Failed to download image')
+            return
+
+        # Prepare image for Claude (encode to base64)
+        logger.info('[IMAGE] Preparing image for Claude...')
+        image_data = await prepare_image_for_claude(image_path)
+
+        if not image_data:
+            await update.message.reply_text('❌ Failed to process image')
+            cleanup_image_file(image_path)
+            return
+
+        base64_str, mime_type = image_data
+        logger.info(f'[IMAGE] Image prepared: {mime_type}, {len(base64_str)} chars base64')
+
+        # Show uploading status
+        await update.message.reply_text('📸 Image received, analyzing...')
+
+        # Build message with image data as base64 URI
+        # The SDK's query() method expects a string, not content blocks
+        image_uri = f'data:{mime_type};base64,{base64_str}'
+
+        if caption_text.strip():
+            message = f'{caption_text}\n\n{image_uri}'
+        else:
+            message = image_uri
+
+        # Send to Claude as a text message with embedded image data
+        logger.info('[IMAGE] Sending to Claude...')
+        await session.client.query(message)
+        await _process_response(update, context, session)
+
+    except Exception as e:
+        logger.error(f'[IMAGE] Error handling image: {e}', exc_info=True)
+        await update.message.reply_text(f'❌ Error processing image: {e}')
+
+    finally:
+        # Cleanup temp image file
+        if image_path and image_path.exists():
+            cleanup_image_file(image_path)
+
+
 async def _process_response(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1422,10 +1497,9 @@ async def _process_response(
 
 
 async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages."""
+    """Handle text and photo messages."""
     assert update.effective_user
     assert update.message
-    assert update.message.text
     assert update.message.chat
     assert context.user_data is not None
 
@@ -1437,7 +1511,14 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     session = get_session(user_id)
-    text = update.message.text
+
+    # Extract text and check for photos
+    text = update.message.text or update.message.caption or ''
+    has_photo = bool(update.message.photo)  # Check if photo list is non-empty
+
+    # Handle case where photo has no caption/text
+    if has_photo and not text:
+        text = ''
 
     # Check for pending teleport
     if user_id in _pending_teleports:
@@ -1596,8 +1677,12 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if resume_session:
                 await update.message.reply_text('✓ Session resumed after reload.')
 
-        await session.client.query(text)
-        await _process_response(update, context, session)
+        # Handle image if present
+        if has_photo:
+            await _handle_message_with_image(update, context, session, text)
+        else:
+            await session.client.query(text)
+            await _process_response(update, context, session)
 
     except Exception as e:
         logger.error(f'Error: {e}', exc_info=True)
@@ -1642,7 +1727,8 @@ def create_telegram_app(config: Config) -> Application:
     app.add_handler(CommandHandler('cancel', tg_handle_cancel))
     app.add_handler(CommandHandler('link', tg_handle_link))
     app.add_handler(CallbackQueryHandler(tg_handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_handle_message))
+    # Handle both text messages and photos (with optional captions)
+    app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.PHOTO, tg_handle_message))
 
     # Debug: catch ALL updates in a separate group
     from telegram.ext import TypeHandler
