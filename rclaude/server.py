@@ -27,7 +27,6 @@ from claude_agent_sdk import (
     PermissionResultAllow,
     PermissionResultDeny,
     ToolPermissionContext,
-    HookMatcher,
 )
 from claude_agent_sdk.types import HookInput, HookContext, SyncHookJSONOutput
 
@@ -74,15 +73,21 @@ def _get_watcher_pid_file(wrapper_pid: int) -> Path:
 
 
 def _trigger_shutdown() -> None:
-    """Trigger server shutdown and kill watcher if running in reload mode."""
+    """Trigger server shutdown if started by wrapper (not standalone)."""
     import signal as sig
+
+    # Only auto-shutdown if started by a wrapper (has RCLAUDE_WRAPPER_PID)
+    # Standalone servers (rclaude serve) should keep running
+    wrapper_pid = os.environ.get('RCLAUDE_WRAPPER_PID')
+    if not wrapper_pid:
+        logger.info('[SHUTDOWN] Standalone server, not shutting down')
+        return
 
     event = _get_shutdown_event()
     event.set()
     logger.info('[SHUTDOWN] Server shutdown triggered')
 
-    # Kill watcher process if we have its PID (based on wrapper PID from env)
-    wrapper_pid = os.environ.get('RCLAUDE_WRAPPER_PID')
+    # Kill watcher process if we have its PID
     if wrapper_pid:
         pid_file = _get_watcher_pid_file(int(wrapper_pid))
         if pid_file.exists():
@@ -226,7 +231,7 @@ def create_permission_handler(
                 reply_markup=keyboard,
                 parse_mode='HTML',
             )
-            logger.info(f'[PERMISSION] Sent permission prompt to Telegram')
+            logger.info('[PERMISSION] Sent permission prompt to Telegram')
         except Exception as e:
             logger.error(f'Failed to send permission prompt: {e}')
             # On error, allow the operation (fail-open for usability)
@@ -234,7 +239,7 @@ def create_permission_handler(
             return PermissionResultAllow(updated_input=input_data)
 
         # Wait for user response (no timeout - like CLI behavior)
-        logger.info(f'[PERMISSION] Waiting for user response on event...')
+        logger.info('[PERMISSION] Waiting for user response on event...')
         try:
             await pending.event.wait()
             logger.info(f'[PERMISSION] Event wait completed! result={pending.result}')
@@ -687,7 +692,7 @@ async def tg_handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def tg_handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle inline keyboard callbacks for questions and permissions."""
     print('[CALLBACK] tg_handle_callback ENTERED', flush=True)
-    logger.info(f'[CALLBACK] tg_handle_callback ENTERED')
+    logger.info('[CALLBACK] tg_handle_callback ENTERED')
     try:
         assert update.effective_user
         assert update.callback_query
@@ -714,13 +719,13 @@ async def tg_handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Handle permission callbacks
     if data.startswith('perm:'):
-        logger.info(f'[CALLBACK] Handling permission callback')
+        logger.info('[CALLBACK] Handling permission callback')
         await _handle_permission_callback(update, context, session, data)
         return
 
     # Handle question callbacks
     if data.startswith('q:'):
-        logger.info(f'[CALLBACK] Handling question callback')
+        logger.info('[CALLBACK] Handling question callback')
         await _handle_question_callback(update, context, session, data)
         return
 
@@ -751,9 +756,9 @@ async def _handle_permission_callback(
         # Allow once
         pending.result = PermissionResultAllow(updated_input=pending.input_data)
         await query.edit_message_text('✓ Allowed (once)')
-        logger.info(f'[PERM_CALLBACK] Setting event for allow')
+        logger.info('[PERM_CALLBACK] Setting event for allow')
         pending.event.set()
-        logger.info(f'[PERM_CALLBACK] Event set!')
+        logger.info('[PERM_CALLBACK] Event set!')
 
     elif action == 'always':
         # Add to CC permission file, then allow
@@ -761,14 +766,14 @@ async def _handle_permission_callback(
         pending.result = PermissionResultAllow(updated_input=pending.input_data)
         rule = generate_permission_rule(pending.tool_name, pending.input_data)
         await query.edit_message_text(f'✓ Allowed (always)\n<code>{rule}</code>', parse_mode='HTML')
-        logger.info(f'[PERM_CALLBACK] Setting event for always-allow')
+        logger.info('[PERM_CALLBACK] Setting event for always-allow')
         pending.event.set()
 
     elif action == 'reject':
         # Ask for rejection reason
         session.waiting_for_rejection_reason = True
         await query.edit_message_text('Type your rejection reason:')
-        logger.info(f'[PERM_CALLBACK] Waiting for rejection reason')
+        logger.info('[PERM_CALLBACK] Waiting for rejection reason')
         # Don't signal yet - wait for text input
 
 

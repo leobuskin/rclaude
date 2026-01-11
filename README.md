@@ -1,5 +1,7 @@
 # rclaude
 
+[![PyPI](https://img.shields.io/pypi/v/rclaude)](https://pypi.org/project/rclaude/)
+
 Remote control for [Claude Code](https://claude.ai/code) via Telegram. Seamlessly teleport your coding sessions between terminal and phone.
 
 ## Features

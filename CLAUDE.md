@@ -25,6 +25,7 @@ rclaude setup      # Interactive setup wizard
 rclaude serve      # Start HTTP + Telegram server
 rclaude status     # Show configuration status
 rclaude            # Run Claude Code with teleport support
+rclaude -- -c      # Pass args to Claude (e.g., continue last session)
 ```
 
 ## Architecture
@@ -34,7 +35,9 @@ rclaude enables remote Claude Code control via Telegram with session teleportati
 ### Core Components
 
 **CLI Layer** (`cli.py`, `__main__.py`)
-- Click-based CLI with commands: `setup`, `serve`, `run`, `status`, `uninstall`
+- Click-based CLI with commands: `setup`, `serve`, `status`, `uninstall`
+- Default action (no subcommand) runs Claude with teleport support
+- Use `--` to pass arguments to Claude: `rclaude -- --resume <id>`
 - Entry point at `rclaude.__main__:main`
 
 **Configuration** (`settings.py`, `config.py`)

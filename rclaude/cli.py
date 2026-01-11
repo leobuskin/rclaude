@@ -9,7 +9,37 @@ from rclaude import __version__
 from rclaude.settings import load_config, CONFIG_FILE
 
 
-@click.group(invoke_without_command=True)
+def _run_wrapper(claude_args: list[str], reload: bool = False, verbose: bool = False) -> None:
+    """Run Claude Code wrapper with given arguments."""
+    import os
+
+    # CLI flags override env vars
+    reload = reload or os.environ.get('RCLAUDE_RELOAD') == '1'
+    verbose = verbose or os.environ.get('RCLAUDE_VERBOSE') == '1'
+
+    if verbose:
+        import logging
+
+        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    config = load_config()
+
+    if not config.is_configured():
+        click.echo('rclaude is not configured. Run: rclaude setup')
+        sys.exit(1)
+
+    from rclaude.wrapper import run_claude_wrapper
+
+    sys.exit(run_claude_wrapper(config, claude_args, reload=reload, verbose=verbose))
+
+
+@click.group(
+    invoke_without_command=True,
+    context_settings={
+        'allow_extra_args': True,
+        'allow_interspersed_args': False,
+    },
+)
 @click.option('--version', '-V', is_flag=True, help='Show version')
 @click.option('--reload', '-r', is_flag=True, help='Start server in reload mode (dev)')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
@@ -18,19 +48,25 @@ def main(ctx: click.Context, version: bool, reload: bool, verbose: bool) -> None
     """rclaude - Remote Claude Code control via Telegram.
 
     Run without arguments to start Claude Code with teleportation support.
+
+    \b
+    Pass arguments to Claude after --:
+      rclaude -- --resume <id>
+      rclaude -- -c
+      rclaude -- -p "query"
+
+    \b
+    Dev options (flags or environment):
+      -r, --reload / RCLAUDE_RELOAD=1   Hot-reload server on code changes
+      -v, --verbose / RCLAUDE_VERBOSE=1 Enable debug logging
     """
-    if verbose:
-        import logging
-
-        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
     if version:
         click.echo(f'rclaude {__version__}')
         return
 
     if ctx.invoked_subcommand is None:
-        # Default action: run the wrapper
-        ctx.invoke(run, reload=reload, verbose=verbose)
+        # Default action: run claude with extra args (after --)
+        _run_wrapper(ctx.args, reload=reload, verbose=verbose)
 
 
 @main.command()
@@ -42,10 +78,9 @@ def setup() -> None:
 
 
 @main.command()
-@click.option('--foreground', '-f', is_flag=True, help="Run in foreground (don't daemonize)")
 @click.option('--reload', '-r', is_flag=True, help='Auto-reload on code changes (dev mode)')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
-def serve(foreground: bool, reload: bool, verbose: bool) -> None:
+def serve(reload: bool, verbose: bool) -> None:
     """Start the rclaude server (HTTP + Telegram bot)."""
     if verbose:
         import logging
@@ -136,26 +171,6 @@ def _serve_with_reload(config, verbose: bool = False) -> None:
     except KeyboardInterrupt:
         click.echo('\nStopping...')
         stop_server_gracefully()
-
-
-@main.command()
-@click.option('--reload', '-r', is_flag=True, help='Start server in reload mode (dev)')
-@click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
-@click.argument('args', nargs=-1)
-def run(reload: bool, verbose: bool, args: tuple[str, ...]) -> None:
-    """Run Claude Code with teleportation support.
-
-    Any arguments are passed through to Claude.
-    """
-    config = load_config()
-
-    if not config.is_configured():
-        click.echo('rclaude is not configured. Run: rclaude setup')
-        sys.exit(1)
-
-    from rclaude.wrapper import run_claude_wrapper
-
-    sys.exit(run_claude_wrapper(config, list(args), reload=reload, verbose=verbose))
 
 
 @main.command()
