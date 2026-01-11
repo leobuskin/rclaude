@@ -238,7 +238,8 @@ def teleport_hook() -> None:
     # Auto-start server if not running
     if not is_server_running(config):
         try:
-            start_server_background(config)
+            reload_mode = os.environ.get('GLAUDE_RELOAD') == '1'
+            start_server_background(config, reload=reload_mode)
         except RuntimeError as e:
             click.echo(f'Error: Failed to start server - {e}', err=True)
             sys.exit(1)
