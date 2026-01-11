@@ -512,17 +512,22 @@ async def tg_handle_cc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text('No active session. Start one first.')
         return
 
+    if not session.session_id:
+        await update.message.reply_text('No resumable session (started fresh). Use terminal directly.')
+        # Just clear the client without trying to resume
+        session.client = None
+        return
+
     # Signal wrapper to return to terminal
-    session_id = session.session_id or 'latest'
+    session_id = session.session_id
     await session.update_queue.put(SessionUpdate('return_to_terminal', session_id))
 
-    # Disconnect the TG session
-    if session.client:
-        await session.client.disconnect()
-        session.client = None
+    # Don't call disconnect() - causes cancel scope errors with concurrent_updates
+    # Just clear the reference; SDK will clean up
+    session.client = None
 
     await update.message.reply_text(
-        f'💻 Returning to terminal...\n\nSession: `{session_id[:8] if len(session_id) > 8 else session_id}...`\nDirectory: `{session.cwd}`',
+        f'💻 Returning to terminal...\n\nSession: `{session_id[:8]}...`\nDirectory: `{session.cwd}`',
         parse_mode='Markdown',
     )
 
@@ -839,7 +844,10 @@ async def _process_response(
             elif isinstance(message, ResultMessage):
                 if message.is_error and message.result:
                     response_text += f'\n\n❌ Error: {message.result}'
-                # Note: cost display removed (subscription-based)
+                # Capture session_id for /cc functionality
+                if message.session_id and not session.session_id:
+                    session.session_id = message.session_id
+                    logger.info(f'[SESSION] Captured session_id from ResultMessage: {message.session_id[:8]}...')
 
     except Exception as e:
         logger.error(f'Error processing response: {e}')
@@ -900,7 +908,8 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 cli_path=get_local_claude_cli(),
             )
             session.client = ClaudeSDKClient(options=options)
-            session.session_id = teleport.session_id  # Track for /cc
+            # Only track session_id if we're actually resuming (for /cc to work)
+            session.session_id = teleport.session_id if resumable else None
             logger.info(f'[DEBUG] Teleport: connecting with can_use_tool={options.can_use_tool is not None}, resume={resume_id is not None}')
 
             try:
@@ -921,6 +930,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     session.client = ClaudeSDKClient(options=options)
                     await session.client.connect()
                     resumable = False  # Update for message below
+                    session.session_id = None  # Can't resume this session
                     logger.info('[DEBUG] Teleport: connected with fresh session')
                 else:
                     raise
