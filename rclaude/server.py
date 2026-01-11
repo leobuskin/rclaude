@@ -392,6 +392,7 @@ class TeleportRequest:
 
     session_id: str
     cwd: str
+    terminal_id: str
     permission_mode: str = 'default'
 
 
@@ -421,9 +422,12 @@ async def handle_teleport(request: web.Request) -> web.Response:
     session_id = data.get('session_id')
     cwd = data.get('cwd', '.')
     permission_mode = data.get('permission_mode', 'default')
+    terminal_id = data.get('terminal_id')
 
     if not session_id:
         return web.json_response({'error': 'session_id required'}, status=400)
+    if not terminal_id:
+        return web.json_response({'error': 'terminal_id required'}, status=400)
 
     # Get the config to find the user
     config: Config = request.app['config']
@@ -432,10 +436,15 @@ async def handle_teleport(request: web.Request) -> web.Response:
     if not user_id:
         return web.json_response({'error': 'No Telegram user configured'}, status=400)
 
-    logger.info(f'Teleport received: session_id={session_id[:8]}..., cwd={cwd}, mode={permission_mode}')
+    logger.info(f'Teleport received: session={session_id[:8]}..., terminal={terminal_id[:8]}..., cwd={cwd}, mode={permission_mode}')
 
-    # Store pending teleport
-    _pending_teleports[user_id] = TeleportRequest(session_id=session_id, cwd=cwd, permission_mode=permission_mode)
+    # Store pending teleport (keyed by user, most recent wins)
+    _pending_teleports[user_id] = TeleportRequest(
+        session_id=session_id,
+        cwd=cwd,
+        terminal_id=terminal_id,
+        permission_mode=permission_mode,
+    )
 
     # Notify via Telegram
     bot = request.app['telegram_app'].bot
@@ -445,6 +454,7 @@ async def handle_teleport(request: web.Request) -> web.Response:
             chat_id=user_id,
             text=f'📱 Session teleported from terminal!\n\n'
             f'Session: `{session_id[:8]}...`\n'
+            f'Terminal: `{terminal_id[:8]}...`\n'
             f'Directory: `{cwd}`\n'
             f'Mode: {mode_display}\n\n'
             f'Send any message to continue, or /cancel to ignore.',
@@ -494,6 +504,11 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     if not user_id:
         return web.json_response({'error': 'No user configured'}, status=400)
 
+    # Get terminal_id from query params
+    terminal_id = request.query.get('terminal_id')
+    if not terminal_id:
+        return web.json_response({'error': 'terminal_id required'}, status=400)
+
     session = get_session(user_id)
 
     response = web.StreamResponse(
@@ -509,13 +524,20 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
 
     # Track connection
     _sse_connection_count += 1
-    logger.info(f'[SSE] Connection opened, count={_sse_connection_count}')
+    logger.info(f'[SSE] Connection opened for terminal {terminal_id[:8]}..., count={_sse_connection_count}')
 
     # Send initial connection message
     await response.write(b'event: connected\ndata: {}\n\n')
 
     try:
         while True:
+            # Check if this terminal has been superseded by another teleport
+            if session.terminal_id and session.terminal_id != terminal_id:
+                logger.info(f'[SSE] Terminal {terminal_id[:8]}... superseded by {session.terminal_id[:8]}...')
+                data = json.dumps({'type': 'superseded', 'content': 'Another terminal took over'})
+                await response.write(f'event: update\ndata: {data}\n\n'.encode())
+                break
+
             try:
                 # Wait for updates with timeout
                 update = await asyncio.wait_for(session.update_queue.get(), timeout=30)
@@ -534,7 +556,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     finally:
         # Track disconnection
         _sse_connection_count -= 1
-        logger.info(f'[SSE] Connection closed, count={_sse_connection_count}')
+        logger.info(f'[SSE] Connection closed for terminal {terminal_id[:8]}..., count={_sse_connection_count}')
 
         # Check if server should shut down (no more connections and no active TG session)
         if _sse_connection_count == 0 and session.client is None:
@@ -758,16 +780,13 @@ async def tg_handle_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
         else:
-            await update.message.reply_text(
-                f'Unknown mode: {mode_arg}\n\nValid modes: default, accept, plan, dangerous'
-            )
+            await update.message.reply_text(f'Unknown mode: {mode_arg}\n\nValid modes: default, accept, plan, dangerous')
             return
 
     # No argument - show current mode with keyboard
     keyboard = create_mode_keyboard(session.permission_mode)
     await update.message.reply_text(
-        f'<b>Permission Mode</b>\n\nCurrent: {_format_mode_display(session.permission_mode)}\n\n'
-        f'<i>Select a new mode below:</i>',
+        f'<b>Permission Mode</b>\n\nCurrent: {_format_mode_display(session.permission_mode)}\n\n<i>Select a new mode below:</i>',
         parse_mode='HTML',
         reply_markup=keyboard,
     )
@@ -815,8 +834,7 @@ async def tg_handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     keyboard = create_model_keyboard(session.current_model)
     current = session.current_model or 'default (sonnet)'
     await update.message.reply_text(
-        f'<b>AI Model</b>\n\nCurrent: <b>{current}</b>\n\n'
-        '<i>Select a model below:</i>',
+        f'<b>AI Model</b>\n\nCurrent: <b>{current}</b>\n\n<i>Select a model below:</i>',
         parse_mode='HTML',
         reply_markup=keyboard,
     )
@@ -1266,6 +1284,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if user_id in _pending_teleports:
         teleport = _pending_teleports.pop(user_id)
         session.cwd = teleport.cwd
+        session.terminal_id = teleport.terminal_id
         session.permission_mode = cast(PermissionMode, _validate_permission_mode(teleport.permission_mode))
 
         # Check if we can resume the session (has conversation history)
@@ -1293,7 +1312,9 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             session.client = ClaudeSDKClient(options=options)
             # Only track session_id if we're actually resuming (for /cc to work)
             session.session_id = teleport.session_id if resumable else None
-            logger.info(f'[DEBUG] Teleport: connecting with can_use_tool={options.can_use_tool is not None}, resume={resume_id is not None}')
+            logger.info(
+                f'[DEBUG] Teleport: connecting with can_use_tool={options.can_use_tool is not None}, resume={resume_id is not None}'
+            )
 
             try:
                 await session.client.connect()
@@ -1466,6 +1487,7 @@ def create_telegram_app(config: Config) -> Application:
 
     # Debug: catch ALL updates in a separate group
     from telegram.ext import TypeHandler
+
     app.add_handler(TypeHandler(Update, debug_all_updates), group=999)
 
     app.add_error_handler(tg_error_handler)

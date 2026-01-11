@@ -9,6 +9,10 @@ from rclaude import __version__
 from rclaude.settings import load_config, CONFIG_FILE
 
 
+# Claude args extracted from sys.argv by __main__.run() before Click processes them
+_claude_args: list[str] = []
+
+
 def _run_wrapper(claude_args: list[str], reload: bool = False, verbose: bool = False) -> None:
     """Run Claude Code wrapper with given arguments."""
     import os
@@ -33,13 +37,7 @@ def _run_wrapper(claude_args: list[str], reload: bool = False, verbose: bool = F
     sys.exit(run_claude_wrapper(config, claude_args, reload=reload, verbose=verbose))
 
 
-@click.group(
-    invoke_without_command=True,
-    context_settings={
-        'allow_extra_args': True,
-        'allow_interspersed_args': False,
-    },
-)
+@click.group(invoke_without_command=True)
 @click.option('--version', '-V', is_flag=True, help='Show version')
 @click.option('--reload', '-r', is_flag=True, help='Start server in reload mode (dev)')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
@@ -66,7 +64,7 @@ def main(ctx: click.Context, version: bool, reload: bool, verbose: bool) -> None
 
     if ctx.invoked_subcommand is None:
         # Default action: run claude with extra args (after --)
-        _run_wrapper(ctx.args, reload=reload, verbose=verbose)
+        _run_wrapper(_claude_args, reload=reload, verbose=verbose)
 
 
 @main.command()
@@ -254,7 +252,8 @@ def teleport_hook() -> None:
     # Only teleport if called from the rclaude wrapper (terminal mode)
     # The SDK also triggers this hook but we don't want to teleport from TG -> TG
     wrapper_pid = os.environ.get('RCLAUDE_WRAPPER_PID')
-    if not wrapper_pid:
+    terminal_id = os.environ.get('RCLAUDE_TERMINAL_ID')
+    if not wrapper_pid or not terminal_id:
         # Not running under wrapper - likely SDK triggering the hook
         sys.exit(0)
 
@@ -272,7 +271,14 @@ def teleport_hook() -> None:
 
     # POST to teleport endpoint
     url = f'http://{config.server.host}:{config.server.port}/teleport'
-    data = json.dumps({'session_id': session_id, 'cwd': cwd, 'permission_mode': permission_mode}).encode()
+    data = json.dumps(
+        {
+            'session_id': session_id,
+            'cwd': cwd,
+            'permission_mode': permission_mode,
+            'terminal_id': terminal_id,
+        }
+    ).encode()
 
     try:
         req = urllib.request.Request(

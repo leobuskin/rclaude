@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pexpect
@@ -72,7 +73,7 @@ def start_server_background(config: Config, reload: bool = False, verbose: bool 
     raise RuntimeError('Failed to start rclaude server')
 
 
-def stream_session_updates(config: Config, session_id: str) -> tuple[str | None, bool]:
+def stream_session_updates(config: Config, session_id: str, terminal_id: str) -> tuple[str | None, bool]:
     """Stream session updates from server via SSE.
 
     Returns (session_id, should_exit):
@@ -88,7 +89,7 @@ def stream_session_updates(config: Config, session_id: str) -> tuple[str | None,
     print('   Press Ctrl+C to stop.\n')
     print('─' * 60)
 
-    url = f'http://{config.server.host}:{config.server.port}/stream'
+    url = f'http://{config.server.host}:{config.server.port}/stream?terminal_id={terminal_id}'
 
     while True:  # Reconnect loop
         try:
@@ -124,6 +125,10 @@ def stream_session_updates(config: Config, session_id: str) -> tuple[str | None,
                             elif update_type == 'return_to_terminal':
                                 print('\n💻 Returning to terminal...')
                                 return content, False  # Resume, don't stop server
+                            elif update_type == 'superseded':
+                                print('\n⚠️  Another terminal took over the session.')
+                                print('   This terminal is now disconnected.')
+                                return None, False  # Exit gracefully, no resume
                         except json.JSONDecodeError:
                             pass
 
@@ -158,8 +163,10 @@ def run_claude_wrapper(config: Config, args: list[str], reload: bool = False, ve
     print('─' * 60)
 
     # Set env vars so hook can find us and know our settings
+    terminal_id = str(uuid.uuid4())  # Unique ID per terminal session
     env = os.environ.copy()
     env['RCLAUDE_WRAPPER_PID'] = str(os.getpid())
+    env['RCLAUDE_TERMINAL_ID'] = terminal_id
     if reload:
         env['RCLAUDE_RELOAD'] = '1'
     if verbose:
@@ -218,7 +225,7 @@ def run_claude_wrapper(config: Config, args: list[str], reload: bool = False, ve
             teleport_data = None  # Reset for next cycle
 
             # Stream updates from server, handle return-to-terminal
-            resume_session, should_stop = stream_session_updates(config, session_id)
+            resume_session, should_stop = stream_session_updates(config, session_id, terminal_id)
 
             if should_stop:
                 # User pressed Ctrl+C in tail mode

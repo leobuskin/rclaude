@@ -33,7 +33,7 @@ Repository = 'https://github.com/leobuskin/rclaude'
 Issues = 'https://github.com/leobuskin/rclaude/issues'
 
 [project.scripts]
-rclaude = 'rclaude.__main__:main'
+rclaude = 'rclaude.__main__:run'
 
 [build-system]
 requires = ['setuptools>=64', 'setuptools-scm>=8']

@@ -68,6 +68,7 @@ class UserSession:
     waiting_for_rejection_reason: bool = False
     cwd: str = field(default_factory=os.getcwd)
     session_id: str | None = None  # Track current session ID for /cc
+    terminal_id: str | None = None  # Track which terminal this session belongs to
     permission_mode: PermissionMode = 'default'  # Current permission mode
     current_model: str | None = None  # Current model (sonnet, opus, haiku, or full name)
     usage: SessionUsage = field(default_factory=SessionUsage)  # Cost/usage tracking
@@ -102,6 +103,7 @@ def save_session_state() -> None:
         if session.session_id:  # Only save if there's a session to resume
             state[str(user_id)] = {
                 'session_id': session.session_id,
+                'terminal_id': session.terminal_id,
                 'cwd': session.cwd,
                 'is_processing': session.is_processing,
                 'permission_mode': session.permission_mode,
