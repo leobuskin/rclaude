@@ -52,6 +52,29 @@ from glaude.formatting import (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Connection Tracking for Auto-Shutdown
+# ─────────────────────────────────────────────────────────────────────────────
+
+_sse_connection_count = 0
+_shutdown_event: asyncio.Event | None = None
+
+
+def _get_shutdown_event() -> asyncio.Event:
+    """Get or create the shutdown event."""
+    global _shutdown_event
+    if _shutdown_event is None:
+        _shutdown_event = asyncio.Event()
+    return _shutdown_event
+
+
+def _trigger_shutdown() -> None:
+    """Trigger server shutdown."""
+    event = _get_shutdown_event()
+    event.set()
+    logger.info('[SHUTDOWN] Server shutdown triggered')
+
+
 def get_local_claude_cli() -> str | None:
     """Find local Claude CLI, prefer it over SDK bundled version."""
     # Check common locations
@@ -342,6 +365,8 @@ async def handle_prepare_reload(request: web.Request) -> web.Response:
 
 async def handle_stream(request: web.Request) -> web.StreamResponse:
     """SSE endpoint to stream session updates to terminal."""
+    global _sse_connection_count
+
     config: Config = request.app['config']
     user_id = config.telegram.user_id
 
@@ -361,6 +386,10 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     )
     await response.prepare(request)
 
+    # Track connection
+    _sse_connection_count += 1
+    logger.info(f'[SSE] Connection opened, count={_sse_connection_count}')
+
     # Send initial connection message
     await response.write(b'event: connected\ndata: {}\n\n')
 
@@ -376,6 +405,15 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                 await response.write(b'event: keepalive\ndata: {}\n\n')
     except asyncio.CancelledError:
         pass
+    finally:
+        # Track disconnection
+        _sse_connection_count -= 1
+        logger.info(f'[SSE] Connection closed, count={_sse_connection_count}')
+
+        # Check if server should shut down (no more connections and no active TG session)
+        if _sse_connection_count == 0 and session.client is None:
+            logger.info('[SSE] No connections and no active session, triggering shutdown')
+            _trigger_shutdown()
 
     return response
 
@@ -1132,11 +1170,13 @@ async def run_server(config: Config) -> None:
                 # Clear saved state
                 clear_session_state()
 
-        # Run forever
+        # Wait for shutdown signal or external cancellation
+        shutdown_event = _get_shutdown_event()
         try:
-            await asyncio.Event().wait()
+            await shutdown_event.wait()
+            logger.info('[SERVER] Shutdown event received, stopping...')
         except asyncio.CancelledError:
-            pass
+            logger.info('[SERVER] Cancelled, stopping...')
 
         await tg_app.updater.stop()
         await tg_app.stop()

@@ -66,10 +66,10 @@ def start_server_background(config: Config, reload: bool = False) -> subprocess.
 def stream_session_updates(config: Config, session_id: str) -> tuple[str | None, bool]:
     """Stream session updates from server via SSE.
 
-    Returns (session_id, should_stop_server):
+    Returns (session_id, should_exit):
     - (session_id, False) if user ran /cc - resume in terminal
-    - (None, True) if user pressed Ctrl+C - stop server
-    - (None, False) if connection error - don't stop server (might be restarting)
+    - (None, True) if user pressed Ctrl+C - exit wrapper
+    - (None, False) if connection error - might be restarting
     """
     import urllib.request
     import urllib.error
@@ -128,43 +128,12 @@ def stream_session_updates(config: Config, session_id: str) -> tuple[str | None,
             return None, True  # User wants to stop
 
 
-def _stop_server(proc: subprocess.Popen) -> None:
-    """Stop the server process gracefully."""
-    print('\nStopping glaude server...')
-    try:
-        # First try graceful termination
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            # Force kill if still running
-            proc.kill()
-            proc.wait()
-        print('✓ Server stopped')
-    except Exception as e:
-        print(f'Warning: Could not stop server: {e}')
-
-
 def run_claude_wrapper(config: Config, args: list[str], reload: bool = False) -> int:
     """Run Claude Code with teleportation support.
 
     This spawns Claude as a subprocess and monitors for teleport signals.
+    Server is started on-demand by the /tg hook, not here.
     """
-    # Track server process if we start it
-    server_proc: subprocess.Popen | None = None
-
-    # Ensure server is running
-    if not is_server_running(config):
-        msg = 'Starting glaude server'
-        if reload:
-            msg += ' (reload mode)'
-        print(f'{msg}...')
-        try:
-            server_proc = start_server_background(config, reload=reload)
-            print('✓ Server started')
-        except RuntimeError as e:
-            print(f'Warning: {e}')
-
     signal_file = get_signal_file()
 
     # Clear any old signal file
@@ -179,12 +148,16 @@ def run_claude_wrapper(config: Config, args: list[str], reload: bool = False) ->
     print('Starting Claude Code... (use /tg to teleport to Telegram)')
     print('─' * 60)
 
-    # Set env var so hook can find us
+    # Set env vars so hook can find us and know our settings
     env = os.environ.copy()
     env['GLAUDE_WRAPPER_PID'] = str(os.getpid())
+    if reload:
+        env['GLAUDE_RELOAD'] = '1'
 
-    # Track teleport state
+    # Track state for teleport cycles
     teleport_data: dict | None = None
+    current_cwd = os.getcwd()
+    resume_proc: subprocess.Popen | None = None  # Track resumed subprocess for signal handler
 
     # Use pexpect to spawn claude with PTY
     try:
@@ -213,8 +186,11 @@ def run_claude_wrapper(config: Config, args: list[str], reload: bool = False) ->
                     teleport_data = json.loads(signal_file.read_text())
                 except Exception:
                     pass
-            # Terminate claude to exit interact()
-            child.terminate(force=False)
+            # Terminate claude (pexpect child or resumed subprocess)
+            if resume_proc and resume_proc.poll() is None:
+                resume_proc.terminate()
+            else:
+                child.terminate(force=False)
 
         signal.signal(signal.SIGWINCH, handle_resize)
         signal.signal(signal.SIGUSR1, handle_teleport)
@@ -223,27 +199,34 @@ def run_claude_wrapper(config: Config, args: list[str], reload: bool = False) ->
         # Interactive mode - pass through I/O
         child.interact()
 
-        # Check if we teleported
-        if teleport_data:
+        # Teleport loop: supports terminal -> TG -> terminal -> TG -> ...
+        while teleport_data:
             session_id = teleport_data.get('session_id', '')
-            cwd = teleport_data.get('cwd', '.')
+            current_cwd = teleport_data.get('cwd', current_cwd)
             signal_file.unlink(missing_ok=True)
+            teleport_data = None  # Reset for next cycle
 
             # Stream updates from server, handle return-to-terminal
             resume_session, should_stop = stream_session_updates(config, session_id)
 
+            if should_stop:
+                # User pressed Ctrl+C in tail mode
+                return 0
+
             if resume_session:
-                # User ran /cc - resume Claude with session
+                # User ran /cc - resume Claude with session using Popen
                 print(f'\nResuming session {resume_session[:8]}...')
                 print('─' * 60)
                 resume_cmd = ['claude', '--resume', resume_session]
-                subprocess.run(resume_cmd, cwd=cwd)
+                resume_proc = subprocess.Popen(resume_cmd, cwd=current_cwd, env=env)
+                exit_code = resume_proc.wait()
+                print(f'[DEBUG] Resumed Claude exited with code {exit_code}')
+                resume_proc = None
+                # After resume exits, check if we teleported again (loop continues if teleport_data set)
+            else:
+                print('[DEBUG] No resume session, exiting loop')
 
-            # Only clean up server if user explicitly stopped (Ctrl+C)
-            if should_stop and server_proc:
-                _stop_server(server_proc)
-            return 0
-
+        print(f'[DEBUG] Exiting wrapper, child.exitstatus={child.exitstatus}')
         return child.exitstatus or 0
 
     except pexpect.exceptions.ExceptionPexpect as e:
@@ -251,29 +234,3 @@ def run_claude_wrapper(config: Config, args: list[str], reload: bool = False) ->
         return 1
     finally:
         signal_file.unlink(missing_ok=True)
-        # Note: We don't stop server here on normal exit
-        # Only stop when exiting tail mode (teleport completed)
-
-
-def run_claude_simple(config: Config, args: list[str]) -> int:
-    """Simple wrapper that just runs claude (fallback)."""
-    # Ensure server is running
-    if not is_server_running(config):
-        print('Starting glaude server...', end=' ', flush=True)
-        try:
-            start_server_background(config)
-            print('✓')
-        except RuntimeError as e:
-            print(f'Warning: {e}')
-
-    # Just run claude directly
-    cmd = ['claude'] + args
-
-    try:
-        result = subprocess.run(cmd)
-        return result.returncode
-    except FileNotFoundError:
-        print('Error: claude command not found. Is Claude Code installed?')
-        return 1
-    except KeyboardInterrupt:
-        return 130
