@@ -3,12 +3,15 @@
 import asyncio
 import json
 import logging
+import os
 import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable, Coroutine
 
 from aiohttp import web
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.constants import ChatAction
 
@@ -17,14 +20,36 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     AssistantMessage,
     ResultMessage,
+    UserMessage,
     TextBlock,
     ToolUseBlock,
     ToolResultBlock,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ToolPermissionContext,
+    HookMatcher,
 )
+from claude_agent_sdk.types import HookInput, HookContext, SyncHookJSONOutput
 
 from glaude.settings import Config
-from glaude.session import get_session, PendingQuestion, UserSession, SessionUpdate
-from glaude.formatting import send_text, send_tool_call, send_tool_result, create_question_keyboard
+from glaude.session import (
+    get_session,
+    PendingQuestion,
+    PendingPermission,
+    UserSession,
+    SessionUpdate,
+    save_session_state,
+    load_session_state,
+    clear_session_state,
+)
+from glaude.formatting import (
+    send_text,
+    send_tool_call,
+    send_tool_result,
+    create_question_keyboard,
+    format_permission_prompt,
+    create_permission_keyboard,
+)
 
 
 def get_local_claude_cli() -> str | None:
@@ -42,8 +67,155 @@ def get_local_claude_cli() -> str | None:
     return None  # Will use SDK bundled
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Dummy Hook for can_use_tool
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Required workaround: In Python, can_use_tool requires a PreToolUse hook that
+# returns {"continue_": True} to keep the stream open. Without this hook, the
+# stream closes before the permission callback can be invoked.
+# See: https://platform.claude.com/docs/en/agent-sdk/user-input
+
+
+async def dummy_pretool_hook(
+    input_data: HookInput,
+    tool_use_id: str | None,
+    context: HookContext,
+) -> SyncHookJSONOutput:
+    """Keep stream open for can_use_tool callback."""
+    # TypedDict is just a type hint - return a plain dict
+    result: SyncHookJSONOutput = {'continue_': True}
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Permission System
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Tools that require interactive approval
+APPROVAL_REQUIRED_TOOLS = {'Edit', 'Write', 'Bash', 'NotebookEdit'}
+
+
+def generate_permission_rule(tool_name: str, input_data: dict[str, Any]) -> str:
+    """Generate CC-compatible permission rule pattern."""
+    if tool_name == 'Bash':
+        command = input_data.get('command', '')
+        # Extract base command (first word)
+        base_cmd = command.split()[0] if command else ''
+        return f'Bash({base_cmd}:*)'
+    elif tool_name == 'Edit':
+        file_path = input_data.get('file_path', '')
+        return f'Edit(//{file_path})'
+    elif tool_name == 'Write':
+        file_path = input_data.get('file_path', '')
+        return f'Write(//{file_path})'
+    elif tool_name == 'NotebookEdit':
+        notebook_path = input_data.get('notebook_path', '')
+        return f'NotebookEdit(//{notebook_path})'
+    else:
+        return f'{tool_name}(*)'
+
+
+async def add_permission_rule(cwd: str, tool_name: str, input_data: dict[str, Any]) -> None:
+    """Add a permission rule to .claude/settings.local.json in the project."""
+    settings_path = Path(cwd) / '.claude' / 'settings.local.json'
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load existing settings
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text())
+        except json.JSONDecodeError:
+            settings = {}
+    else:
+        settings = {}
+
+    if 'permissions' not in settings:
+        settings['permissions'] = {'allow': [], 'deny': [], 'ask': []}
+
+    # Generate rule pattern
+    rule = generate_permission_rule(tool_name, input_data)
+
+    # Add if not already present
+    if rule not in settings['permissions']['allow']:
+        settings['permissions']['allow'].append(rule)
+        settings_path.write_text(json.dumps(settings, indent=2))
+        logger.info(f'Added permission rule: {rule}')
+
+
+def create_permission_handler(
+    bot: Bot,
+    user_id: int,
+    session: UserSession,
+) -> Callable[[str, dict[str, Any], ToolPermissionContext], Coroutine[Any, Any, PermissionResultAllow | PermissionResultDeny]]:
+    """Create a permission handler bound to a specific Telegram context."""
+
+    async def permission_handler(
+        tool_name: str,
+        input_data: dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        """Handle tool permission requests via Telegram."""
+        logger.info(f'[PERMISSION] can_use_tool called: tool={tool_name}')
+        # Auto-allow tools that don't need approval
+        if tool_name not in APPROVAL_REQUIRED_TOOLS:
+            logger.info(f'[PERMISSION] Auto-allowing {tool_name} (not in approval list)')
+            return PermissionResultAllow(updated_input=input_data)
+
+        # Create pending permission request
+        request_id = str(uuid.uuid4())
+        pending = PendingPermission(
+            request_id=request_id,
+            tool_name=tool_name,
+            input_data=input_data,
+        )
+        session.pending_permission = pending
+        logger.info(f'[PERMISSION] Created pending permission: {request_id}')
+
+        # Format and send the permission prompt
+        text = format_permission_prompt(tool_name, input_data)
+        keyboard = create_permission_keyboard()
+
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode='HTML',
+            )
+            logger.info(f'[PERMISSION] Sent permission prompt to Telegram')
+        except Exception as e:
+            logger.error(f'Failed to send permission prompt: {e}')
+            # On error, allow the operation (fail-open for usability)
+            session.pending_permission = None
+            return PermissionResultAllow(updated_input=input_data)
+
+        # Wait for user response (no timeout - like CLI behavior)
+        logger.info(f'[PERMISSION] Waiting for user response on event...')
+        try:
+            await pending.event.wait()
+            logger.info(f'[PERMISSION] Event wait completed! result={pending.result}')
+        except Exception as e:
+            logger.error(f'[PERMISSION] Exception during event.wait(): {e}')
+            session.pending_permission = None
+            return PermissionResultDeny(message=f'Error waiting: {e}', interrupt=False)
+
+        # Clear pending permission
+        session.pending_permission = None
+
+        if pending.result is not None:
+            logger.info(f'[PERMISSION] Returning result: {type(pending.result).__name__}')
+            return pending.result
+        else:
+            # Should not happen, but default to deny
+            logger.warning('[PERMISSION] No result set, returning deny')
+            return PermissionResultDeny(message='No response received', interrupt=False)
+
+    return permission_handler
+
+
 def can_resume_session(session_id: str, cwd: str) -> bool:
-    """Check if a session can be resumed (exists and has content)."""
+    """Check if a session can be resumed (exists and has actual conversation content)."""
     # Build the session file path (same logic as Claude Code uses)
     project_path = cwd.replace('/', '-').replace(':', '')
     if project_path.startswith('-'):
@@ -52,8 +224,23 @@ def can_resume_session(session_id: str, cwd: str) -> bool:
     log_dir = Path.home() / '.claude' / 'projects' / f'-{project_path}'
     log_file = log_dir / f'{session_id}.jsonl'
 
-    # Session must exist and have content
-    return log_file.exists() and log_file.stat().st_size > 0
+    if not log_file.exists():
+        logger.info(f'[SESSION] can_resume_session: {session_id[:8]}... -> False (file not found)')
+        return False
+
+    # Check if file has actual message content, not just summaries
+    # Valid sessions have "type":"user" or "type":"assistant" messages
+    try:
+        with open(log_file) as f:
+            for line in f:
+                if '"type":"user"' in line or '"type":"assistant"' in line:
+                    logger.info(f'[SESSION] can_resume_session: {session_id[:8]}... -> True (has messages)')
+                    return True
+        logger.info(f'[SESSION] can_resume_session: {session_id[:8]}... -> False (no messages, only metadata)')
+        return False
+    except Exception as e:
+        logger.warning(f'[SESSION] can_resume_session: {session_id[:8]}... -> False (error: {e})')
+        return False
 
 
 logger = logging.getLogger('glaude')
@@ -103,6 +290,8 @@ async def handle_teleport(request: web.Request) -> web.Response:
     if not user_id:
         return web.json_response({'error': 'No Telegram user configured'}, status=400)
 
+    logger.info(f'Teleport received: session_id={session_id[:8]}..., cwd={cwd}')
+
     # Store pending teleport
     _pending_teleports[user_id] = TeleportRequest(session_id=session_id, cwd=cwd)
 
@@ -127,6 +316,28 @@ async def handle_teleport(request: web.Request) -> web.Response:
 async def handle_health(request: web.Request) -> web.Response:
     """Health check endpoint."""
     return web.json_response({'status': 'ok'})
+
+
+async def handle_prepare_reload(request: web.Request) -> web.Response:
+    """Prepare for hot-reload by saving session state."""
+    config: Config = request.app['config']
+    user_id = config.telegram.user_id
+
+    if user_id:
+        session = get_session(user_id)
+        # Disconnect SDK client gracefully
+        if session.client:
+            try:
+                await session.client.disconnect()
+            except Exception as e:
+                logger.warning(f'Error disconnecting client: {e}')
+            session.client = None
+
+    # Save session state to disk
+    save_session_state()
+    logger.info('Session state saved for hot-reload')
+
+    return web.json_response({'ok': True, 'message': 'Ready for reload'})
 
 
 async def handle_stream(request: web.Request) -> web.StreamResponse:
@@ -223,6 +434,7 @@ def create_http_app(config: Config) -> web.Application:
 
     app.router.add_post('/teleport', handle_teleport)
     app.router.add_get('/health', handle_health)
+    app.router.add_post('/api/prepare-reload', handle_prepare_reload)
     app.router.add_get('/stream', handle_stream)
 
     # Setup link endpoints
@@ -405,13 +617,22 @@ async def tg_handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def tg_handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline keyboard callbacks."""
-    assert update.effective_user
-    assert update.callback_query
-    assert update.effective_chat
+    """Handle inline keyboard callbacks for questions and permissions."""
+    print('[CALLBACK] tg_handle_callback ENTERED', flush=True)
+    logger.info(f'[CALLBACK] tg_handle_callback ENTERED')
+    try:
+        assert update.effective_user
+        assert update.callback_query
+        assert update.effective_chat
+    except AssertionError as e:
+        logger.error(f'[CALLBACK] Assertion failed: {e}, update={update}')
+        return
+
+    logger.info(f'[CALLBACK] Received callback query from user {update.effective_user.id}')
 
     config: Config = context.bot_data['config']
     if update.effective_user.id != config.telegram.user_id:
+        logger.warning(f'[CALLBACK] Unauthorized user {update.effective_user.id}')
         return
 
     query = update.callback_query
@@ -419,13 +640,83 @@ async def tg_handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     session = get_session(update.effective_user.id)
 
-    if not session.pending_question:
-        await query.edit_message_text('No pending question.')
-        return
-
     assert query.data
     data = query.data
-    if not data.startswith('q:'):
+    logger.info(f'[CALLBACK] Callback data: {data}')
+
+    # Handle permission callbacks
+    if data.startswith('perm:'):
+        logger.info(f'[CALLBACK] Handling permission callback')
+        await _handle_permission_callback(update, context, session, data)
+        return
+
+    # Handle question callbacks
+    if data.startswith('q:'):
+        logger.info(f'[CALLBACK] Handling question callback')
+        await _handle_question_callback(update, context, session, data)
+        return
+
+    logger.warning(f'[CALLBACK] Unknown callback data: {data}')
+
+
+async def _handle_permission_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: UserSession,
+    data: str,
+) -> None:
+    """Handle permission inline keyboard callbacks."""
+    assert update.callback_query
+    query = update.callback_query
+
+    pending = session.pending_permission
+    logger.info(f'[PERM_CALLBACK] pending_permission: {pending}')
+    if not pending:
+        logger.warning('[PERM_CALLBACK] No pending permission found!')
+        await query.edit_message_text('No pending permission request.')
+        return
+
+    action = data.split(':')[1]
+    logger.info(f'[PERM_CALLBACK] Action: {action}, request_id: {pending.request_id}')
+
+    if action == 'allow':
+        # Allow once
+        pending.result = PermissionResultAllow(updated_input=pending.input_data)
+        await query.edit_message_text('✓ Allowed (once)')
+        logger.info(f'[PERM_CALLBACK] Setting event for allow')
+        pending.event.set()
+        logger.info(f'[PERM_CALLBACK] Event set!')
+
+    elif action == 'always':
+        # Add to CC permission file, then allow
+        await add_permission_rule(session.cwd, pending.tool_name, pending.input_data)
+        pending.result = PermissionResultAllow(updated_input=pending.input_data)
+        rule = generate_permission_rule(pending.tool_name, pending.input_data)
+        await query.edit_message_text(f'✓ Allowed (always)\n<code>{rule}</code>', parse_mode='HTML')
+        logger.info(f'[PERM_CALLBACK] Setting event for always-allow')
+        pending.event.set()
+
+    elif action == 'reject':
+        # Ask for rejection reason
+        session.waiting_for_rejection_reason = True
+        await query.edit_message_text('Type your rejection reason:')
+        logger.info(f'[PERM_CALLBACK] Waiting for rejection reason')
+        # Don't signal yet - wait for text input
+
+
+async def _handle_question_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: UserSession,
+    data: str,
+) -> None:
+    """Handle question inline keyboard callbacks."""
+    assert update.callback_query
+    assert update.effective_chat
+    query = update.callback_query
+
+    if not session.pending_question:
+        await query.edit_message_text('No pending question.')
         return
 
     parts = data.split(':')
@@ -532,8 +823,10 @@ async def _process_response(
                         )
                         await session.update_queue.put(SessionUpdate('tool_call', tool_desc))
 
-                    elif isinstance(block, ToolResultBlock):
-                        # Send tool result as expandable quote
+            elif isinstance(message, UserMessage):
+                # Tool results come in UserMessage
+                for block in message.content:
+                    if isinstance(block, ToolResultBlock):
                         await send_tool_result(update, block)
                         # Don't send full tool results to terminal (too verbose)
 
@@ -583,40 +876,72 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         # Build options - only include resume if session has content
         try:
+            # Get bot for permission handler
+            bot = context.bot
+            permission_handler = create_permission_handler(bot, user_id, session)
+
+            # Try to resume, but fall back to fresh session if it fails
+            resume_id = teleport.session_id if resumable else None
+
             options = ClaudeAgentOptions(
-                allowed_tools=[
-                    'Read',
-                    'Write',
-                    'Edit',
-                    'Bash',
-                    'Glob',
-                    'Grep',
-                    'Task',
-                    'WebFetch',
-                    'WebSearch',
-                    'TodoWrite',
-                    'AskUserQuestion',
-                    'NotebookEdit',
-                ],
-                permission_mode='acceptEdits',
+                # Don't pass tools - defaults to all tools available (like CLI)
+                # Don't use allowed_tools - it creates permission ALLOW rules that bypass can_use_tool!
+                setting_sources=['user', 'project', 'local'],  # Load CC permission rules
+                permission_mode='default',  # Use default mode - SDK handles via can_use_tool
+                can_use_tool=permission_handler,  # Interactive approval via Telegram
                 cwd=session.cwd,
-                resume=teleport.session_id if resumable else None,
+                resume=resume_id,
                 cli_path=get_local_claude_cli(),
             )
             session.client = ClaudeSDKClient(options=options)
             session.session_id = teleport.session_id  # Track for /cc
-            await session.client.connect()
+            logger.info(f'[DEBUG] Teleport: connecting with can_use_tool={options.can_use_tool is not None}, resume={resume_id is not None}')
+
+            try:
+                await session.client.connect()
+                logger.info('[DEBUG] Teleport: connected successfully')
+            except Exception as connect_err:
+                # If resume failed, try fresh session
+                if resume_id:
+                    logger.warning(f'[DEBUG] Resume failed, trying fresh session: {connect_err}')
+                    options = ClaudeAgentOptions(
+                        setting_sources=['user', 'project', 'local'],
+                        permission_mode='default',
+                        can_use_tool=permission_handler,
+                        cwd=session.cwd,
+                        resume=None,  # Fresh session
+                        cli_path=get_local_claude_cli(),
+                    )
+                    session.client = ClaudeSDKClient(options=options)
+                    await session.client.connect()
+                    resumable = False  # Update for message below
+                    logger.info('[DEBUG] Teleport: connected with fresh session')
+                else:
+                    raise
 
             if resumable:
                 await update.message.reply_text('✓ Session resumed. Continuing...')
             else:
-                await update.message.reply_text('✓ Connected. Starting fresh session (no prior conversation).')
+                await update.message.reply_text('✓ Connected. Starting fresh session.')
         except Exception as e:
+            logger.error(f'[DEBUG] Teleport failed: {e}')
             await update.message.reply_text(f'Failed to connect: {e}')
             return
 
     # Push user message to stream
     await session.update_queue.put(SessionUpdate('user', text))
+
+    # Handle waiting for rejection reason
+    if session.waiting_for_rejection_reason and session.pending_permission:
+        session.waiting_for_rejection_reason = False
+        pending = session.pending_permission
+        pending.result = PermissionResultDeny(
+            message=text,
+            interrupt=False,  # Let Claude try something else
+        )
+        pending.event.set()
+        await update.message.reply_text(f'✗ Rejected: {text}')
+        return
 
     # Handle waiting for custom answer
     if context.user_data.get('waiting_for_answer') and session.pending_question:
@@ -647,27 +972,38 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     try:
         if not session.client:
+            # Get bot for permission handler
+            bot = context.bot
+            permission_handler = create_permission_handler(bot, user_id, session)
+
+            # Check if we should resume a saved session (from hot-reload)
+            resume_session = None
+            if session.session_id and can_resume_session(session.session_id, session.cwd):
+                resume_session = session.session_id
+
             options = ClaudeAgentOptions(
-                allowed_tools=[
-                    'Read',
-                    'Write',
-                    'Edit',
-                    'Bash',
-                    'Glob',
-                    'Grep',
-                    'Task',
-                    'WebFetch',
-                    'WebSearch',
-                    'TodoWrite',
-                    'AskUserQuestion',
-                    'NotebookEdit',
-                ],
-                permission_mode='acceptEdits',
+                # Don't pass tools - defaults to all tools available (like CLI)
+                # Don't use allowed_tools - it creates permission ALLOW rules that bypass can_use_tool!
+                setting_sources=['user', 'project', 'local'],  # Load CC permission rules
+                permission_mode='default',  # Use default mode - SDK handles via can_use_tool
+                can_use_tool=permission_handler,  # Interactive approval via Telegram
+                # Required: PreToolUse hook keeps stream open for can_use_tool callback
+                # hooks={'PreToolUse': [HookMatcher(matcher=None, hooks=[dummy_pretool_hook])]},
                 cwd=session.cwd,
+                resume=resume_session,
                 cli_path=get_local_claude_cli(),
             )
             session.client = ClaudeSDKClient(options=options)
-            await session.client.connect()
+            logger.info(f'[DEBUG] Connecting with can_use_tool={options.can_use_tool is not None}')
+            try:
+                await session.client.connect()
+                logger.info('[DEBUG] Connected successfully')
+            except ValueError as e:
+                logger.error(f'[DEBUG] ValueError during connect: {e}')
+                raise
+
+            if resume_session:
+                await update.message.reply_text('✓ Session resumed after reload.')
 
         await session.client.query(text)
         await _process_response(update, context, session)
@@ -686,12 +1022,22 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def tg_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle errors."""
-    logger.error(f'Error: {context.error}')
+    print(f'[TG_ERROR] Error: {context.error}', flush=True)
+    logger.error(f'[TG_ERROR] Error: {context.error}', exc_info=context.error)
+
+
+async def debug_all_updates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Debug handler to log ALL updates."""
+    print(f'[DEBUG_ALL] Update type: {type(update)}', flush=True)
+    print(f'[DEBUG_ALL] Has callback_query: {update.callback_query is not None}', flush=True)
+    if update.callback_query:
+        print(f'[DEBUG_ALL] Callback data: {update.callback_query.data}', flush=True)
 
 
 def create_telegram_app(config: Config) -> Application:
     """Create the Telegram application."""
-    app = Application.builder().token(config.telegram.bot_token).build()
+    # Enable concurrent updates so callback queries can be processed while waiting for permission
+    app = Application.builder().token(config.telegram.bot_token).concurrent_updates(True).build()
     app.bot_data['config'] = config
 
     app.add_handler(CommandHandler('start', tg_handle_start))
@@ -703,6 +1049,10 @@ def create_telegram_app(config: Config) -> Application:
     app.add_handler(CommandHandler('link', tg_handle_link))
     app.add_handler(CallbackQueryHandler(tg_handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_handle_message))
+
+    # Debug: catch ALL updates in a separate group
+    from telegram.ext import TypeHandler
+    app.add_handler(TypeHandler(Update, debug_all_updates), group=999)
 
     app.add_error_handler(tg_error_handler)
 
@@ -735,9 +1085,36 @@ async def run_server(config: Config) -> None:
     async with tg_app:
         await tg_app.start()
         assert tg_app.updater is not None
-        await tg_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await tg_app.updater.start_polling(
+            allowed_updates=['message', 'callback_query', 'edited_message'],
+            drop_pending_updates=True,
+        )
 
         logger.info('Telegram bot started')
+
+        # Check for saved session state from hot-reload
+        saved_state = load_session_state()
+        if saved_state and config.telegram.user_id:
+            user_id = config.telegram.user_id
+            if user_id in saved_state:
+                state = saved_state[user_id]
+                # Restore session metadata
+                session = get_session(user_id)
+                session.cwd = state.get('cwd', os.getcwd())
+                session.session_id = state.get('session_id')
+
+                # Notify user to continue
+                try:
+                    await tg_app.bot.send_message(
+                        chat_id=user_id,
+                        text='🔄 Server reloaded. Send any message to reconnect to your session.',
+                    )
+                    logger.info(f'Notified user {user_id} to reconnect after hot-reload')
+                except Exception as e:
+                    logger.warning(f'Failed to notify user after reload: {e}')
+
+                # Clear saved state
+                clear_session_state()
 
         # Run forever
         try:

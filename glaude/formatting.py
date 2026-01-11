@@ -123,7 +123,10 @@ async def send_tool_call(update: Update, block: ToolUseBlock) -> None:
     if tool_name == 'Bash':
         cmd = tool_input.get('command', '')
         escaped_cmd = escape_html(cmd)
-        text = f'<b>$</b> <pre><code class="language-bash">{escaped_cmd}</code></pre>'
+        if '\n' in cmd:
+            text = f'<pre><code class="language-bash">{escaped_cmd}</code></pre>'
+        else:
+            text = f'<b>$</b> <code>{escaped_cmd}</code>'
     elif tool_name == 'Read':
         path = escape_html(tool_input.get('file_path', ''))
         text = f'📖 <b>Reading</b> <code>{path}</code>'
@@ -187,11 +190,14 @@ async def send_tool_result(update: Update, block: ToolResultBlock) -> None:
     escaped = escape_html(result_text)
     icon = '❌' if block.is_error else '✅'
 
-    # Use expandable blockquote for results
-    if len(result_text) > 200:
-        text = f'{icon} <blockquote expandable>{escaped}</blockquote>'
+    # Use expandable blockquote for long/multiline results, inline for short single-line
+    if '\n' in result_text or len(result_text) > 200:
+        if len(result_text) > 200:
+            text = f'{icon} <blockquote expandable>{escaped}</blockquote>'
+        else:
+            text = f'{icon} <blockquote>{escaped}</blockquote>'
     else:
-        text = f'{icon} <blockquote>{escaped}</blockquote>'
+        text = f'{icon} {escaped}'
 
     try:
         await update.effective_chat.send_message(text, parse_mode='HTML')
@@ -235,3 +241,102 @@ async def create_question_keyboard(question: dict[str, Any]) -> InlineKeyboardMa
     buttons.append([InlineKeyboardButton('Other (type answer)', callback_data='q:0:other')])
 
     return InlineKeyboardMarkup(buttons)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Permission Prompt Formatting
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def format_permission_edit(input_data: dict[str, Any]) -> str:
+    """Format Edit tool permission prompt showing changes."""
+    file_path = input_data.get('file_path', '')
+    old_string = input_data.get('old_string', '')
+    new_string = input_data.get('new_string', '')
+
+    # Truncate if too long
+    max_len = 500
+    old_display = old_string[:max_len] + '...' if len(old_string) > max_len else old_string
+    new_display = new_string[:max_len] + '...' if len(new_string) > max_len else new_string
+
+    return (
+        f'<b>✏️ Edit:</b> <code>{escape_html(file_path)}</code>\n\n'
+        f'<b>Remove:</b>\n<pre>{escape_html(old_display)}</pre>\n\n'
+        f'<b>Add:</b>\n<pre>{escape_html(new_display)}</pre>'
+    )
+
+
+def format_permission_bash(input_data: dict[str, Any]) -> str:
+    """Format Bash tool permission prompt."""
+    command = input_data.get('command', '')
+    description = input_data.get('description', '')
+
+    escaped_cmd = escape_html(command)
+    if '\n' in command:
+        text = f'<pre>{escaped_cmd}</pre>'
+    else:
+        text = f'<b>$</b> <code>{escaped_cmd}</code>'
+    if description:
+        text += f'\n\n<i>{escape_html(description)}</i>'
+    return text
+
+
+def format_permission_write(input_data: dict[str, Any]) -> str:
+    """Format Write tool permission prompt."""
+    file_path = input_data.get('file_path', '')
+    content = input_data.get('content', '')
+
+    # Truncate preview
+    max_len = 1000
+    preview = content[:max_len] + '...' if len(content) > max_len else content
+
+    return (
+        f'<b>📝 Write:</b> <code>{escape_html(file_path)}</code>\n\n'
+        f'<blockquote expandable><pre>{escape_html(preview)}</pre></blockquote>'
+    )
+
+
+def format_permission_notebook(input_data: dict[str, Any]) -> str:
+    """Format NotebookEdit tool permission prompt."""
+    notebook_path = input_data.get('notebook_path', '')
+    cell_type = input_data.get('cell_type', 'code')
+    edit_mode = input_data.get('edit_mode', 'replace')
+    new_source = input_data.get('new_source', '')
+
+    max_len = 500
+    source_preview = new_source[:max_len] + '...' if len(new_source) > max_len else new_source
+
+    return (
+        f'<b>📓 Notebook {edit_mode}:</b> <code>{escape_html(notebook_path)}</code>\n'
+        f'Cell type: <code>{escape_html(cell_type)}</code>\n\n'
+        f'<pre>{escape_html(source_preview)}</pre>'
+    )
+
+
+def format_permission_prompt(tool_name: str, input_data: dict[str, Any]) -> str:
+    """Format a permission request for display in Telegram."""
+    if tool_name == 'Edit':
+        return format_permission_edit(input_data)
+    elif tool_name == 'Bash':
+        return format_permission_bash(input_data)
+    elif tool_name == 'Write':
+        return format_permission_write(input_data)
+    elif tool_name == 'NotebookEdit':
+        return format_permission_notebook(input_data)
+    else:
+        # Generic format for unknown tools
+        import json
+        return f'<b>🔧 {escape_html(tool_name)}</b>\n\n<pre>{escape_html(json.dumps(input_data, indent=2)[:1000])}</pre>'
+
+
+def create_permission_keyboard() -> InlineKeyboardMarkup:
+    """Create inline keyboard for permission approval."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton('✓ Allow', callback_data='perm:allow'),
+            InlineKeyboardButton('✓ Always', callback_data='perm:always'),
+        ],
+        [
+            InlineKeyboardButton('✗ Reject', callback_data='perm:reject'),
+        ],
+    ])
