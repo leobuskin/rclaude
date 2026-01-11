@@ -199,27 +199,21 @@ def _format_model_short(model: str | None) -> str:
 def _parse_context_output(text: str) -> ContextUsage | None:
     """Parse /context command output to extract token usage.
 
-    Expected format:
-        Tokens: 24.4k / 200.0k (12%)
+    Expected formats:
+        **Tokens:** 21.8k / 200.0k (11%)  (markdown from SDK)
+        Tokens: 24.4k / 200.0k (12%)      (plain text from CLI)
     """
-    # Match pattern like "Tokens: 24.4k / 200.0k (12%)"
-    match = re.search(r'Tokens:\s*([\d.]+)k?\s*/\s*([\d.]+)k?\s*\((\d+)%\)', text)
+    # Match pattern like "**Tokens:** 21.8k / 200.0k (11%)" or "Tokens: 24.4k / 200.0k (12%)"
+    match = re.search(r'\*?\*?Tokens:\*?\*?\s*([\d.]+)k\s*/\s*([\d.]+)k\s*\((\d+)%\)', text)
     if not match:
         return None
 
     used_str, max_str, percent_str = match.groups()
 
-    # Parse token counts (handle 'k' suffix)
-    def parse_tokens(s: str) -> int:
-        val = float(s)
-        # If the match included 'k' in the pattern or value is small, multiply
-        if val < 1000:  # Likely in thousands
-            return int(val * 1000)
-        return int(val)
-
+    # Parse token counts (values are in 'k' so multiply by 1000)
     return ContextUsage(
-        tokens_used=parse_tokens(used_str),
-        tokens_max=parse_tokens(max_str),
+        tokens_used=int(float(used_str) * 1000),
+        tokens_max=int(float(max_str) * 1000),
         percent_used=int(percent_str),
     )
 
@@ -1130,23 +1124,32 @@ async def _fetch_context_silently(session: UserSession) -> None:
         await session.client.query('/context')
         # Process messages silently, only extracting context
         async for message in session.client.receive_response():
-            if isinstance(message, SystemMessage):
+            if isinstance(message, UserMessage):
+                # /context output comes in UserMessage with local-command-stdout
+                # content can be a string or a list of blocks
+                content = message.content
+                if isinstance(content, str):
+                    if '<local-command-stdout>' in content:
+                        context_usage = _parse_context_output(content)
+                        if context_usage:
+                            session.context = context_usage
+                            return
+                else:
+                    for block in content:
+                        if isinstance(block, TextBlock) and '<local-command-stdout>' in block.text:
+                            context_usage = _parse_context_output(block.text)
+                            if context_usage:
+                                session.context = context_usage
+                                return
+            elif isinstance(message, SystemMessage):
+                # Fallback for other formats
                 data = message.data
-                text_content = None
-                if 'message' in data:
-                    text_content = data['message']
-                elif 'text' in data:
-                    text_content = data['text']
-                elif 'content' in data:
-                    text_content = data['content']
-                elif 'result' in data:
-                    text_content = data['result']
-
+                text_content = data.get('message') or data.get('text') or data.get('content') or data.get('result')
                 if text_content:
                     context_usage = _parse_context_output(str(text_content))
                     if context_usage:
                         session.context = context_usage
-                        logger.info(f'[CONTEXT] Fetched: {context_usage.tokens_used}/{context_usage.tokens_max} ({context_usage.percent_used}%)')
+                        return
     except Exception as e:
         logger.warning(f'Failed to fetch context: {e}')
 
@@ -1562,13 +1565,28 @@ async def _process_response(
                         await session.update_queue.put(SessionUpdate('tool_call', tool_desc))
 
             elif isinstance(message, UserMessage):
-                # Tool results come in UserMessage
-                for block in message.content:
-                    if isinstance(block, ToolResultBlock):
-                        # Find the original tool call message to edit
-                        msg_info = tool_messages.get(block.tool_use_id)
-                        await send_tool_result(update, block, msg_info)
-                        # Don't send full tool results to terminal (too verbose)
+                # Tool results and local command outputs come in UserMessage
+                # content can be a string or a list of blocks
+                content = message.content
+                if isinstance(content, str):
+                    # Raw string content (e.g., local command output)
+                    if '<local-command-stdout>' in content:
+                        context_usage = _parse_context_output(content)
+                        if context_usage:
+                            session.context = context_usage
+                            logger.info(f'[CONTEXT] Parsed from UserMessage string: {context_usage.percent_used}%')
+                else:
+                    # List of blocks
+                    for block in content:
+                        if isinstance(block, ToolResultBlock):
+                            msg_info = tool_messages.get(block.tool_use_id)
+                            await send_tool_result(update, block, msg_info)
+                        elif isinstance(block, TextBlock):
+                            if '<local-command-stdout>' in block.text:
+                                context_usage = _parse_context_output(block.text)
+                                if context_usage:
+                                    session.context = context_usage
+                                    logger.info(f'[CONTEXT] Parsed from UserMessage block: {context_usage.percent_used}%')
 
             elif isinstance(message, SystemMessage):
                 # Handle system messages (slash command outputs, etc.)
