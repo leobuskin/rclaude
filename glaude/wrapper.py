@@ -63,63 +63,69 @@ def start_server_background(config: Config, reload: bool = False) -> subprocess.
     raise RuntimeError('Failed to start glaude server')
 
 
-def stream_session_updates(config: Config, session_id: str) -> str | None:
+def stream_session_updates(config: Config, session_id: str) -> tuple[str | None, bool]:
     """Stream session updates from server via SSE.
 
-    Returns session_id if we should resume in terminal, None otherwise.
+    Returns (session_id, should_stop_server):
+    - (session_id, False) if user ran /cc - resume in terminal
+    - (None, True) if user pressed Ctrl+C - stop server
+    - (None, False) if connection error - don't stop server (might be restarting)
     """
     import urllib.request
     import urllib.error
 
     print('\n📱 Session on Telegram. Showing live updates...')
     print(f'   Session: {session_id[:8]}...')
-    print('   Press Ctrl+C to return to terminal.\n')
+    print('   Press Ctrl+C to stop.\n')
     print('─' * 60)
 
     url = f'http://{config.server.host}:{config.server.port}/stream'
 
-    try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req) as response:
-            for line in response:
-                line = line.decode('utf-8').strip()
+    while True:  # Reconnect loop
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=60) as response:
+                for line in response:
+                    line = line.decode('utf-8').strip()
 
-                if line.startswith('event:'):
-                    # Skip event type lines, we handle data directly
-                    continue
-
-                if line.startswith('data:'):
-                    data_str = line[5:].strip()
-                    if not data_str or data_str == '{}':
+                    if line.startswith('event:'):
+                        # Skip event type lines, we handle data directly
                         continue
 
-                    try:
-                        data = json.loads(data_str)
-                        update_type = data.get('type', '')
-                        content = data.get('content', '')
+                    if line.startswith('data:'):
+                        data_str = line[5:].strip()
+                        if not data_str or data_str == '{}':
+                            continue
 
-                        if update_type == 'user':
-                            print(f'You (TG): {content[:100]}')
-                        elif update_type == 'text':
-                            # Truncate long text
-                            display = content[:200] + '...' if len(content) > 200 else content
-                            print(f'Claude: {display}')
-                        elif update_type == 'tool_call':
-                            print(f'  → {content}')
-                        elif update_type == 'question':
-                            print(f'  ? {content}')
-                        elif update_type == 'return_to_terminal':
-                            print('\n💻 Returning to terminal...')
-                            return content  # Return session_id to resume
-                    except json.JSONDecodeError:
-                        pass
+                        try:
+                            data = json.loads(data_str)
+                            update_type = data.get('type', '')
+                            content = data.get('content', '')
 
-    except urllib.error.URLError as e:
-        print(f'Connection error: {e.reason}')
-    except KeyboardInterrupt:
-        print('\n\nExiting stream mode.')
+                            if update_type == 'user':
+                                print(f'You (TG): {content[:100]}')
+                            elif update_type == 'text':
+                                # Truncate long text
+                                display = content[:200] + '...' if len(content) > 200 else content
+                                print(f'Claude: {display}')
+                            elif update_type == 'tool_call':
+                                print(f'  → {content}')
+                            elif update_type == 'question':
+                                print(f'  ? {content}')
+                            elif update_type == 'return_to_terminal':
+                                print('\n💻 Returning to terminal...')
+                                return content, False  # Resume, don't stop server
+                        except json.JSONDecodeError:
+                            pass
 
-    return None
+        except urllib.error.URLError as e:
+            # Connection dropped - server might be restarting (hot reload)
+            print(f'Connection lost ({e.reason}), reconnecting...')
+            time.sleep(2)  # Wait before reconnect
+            continue
+        except KeyboardInterrupt:
+            print('\n\nStopping...')
+            return None, True  # User wants to stop
 
 
 def _stop_server(proc: subprocess.Popen) -> None:
@@ -224,7 +230,7 @@ def run_claude_wrapper(config: Config, args: list[str], reload: bool = False) ->
             signal_file.unlink(missing_ok=True)
 
             # Stream updates from server, handle return-to-terminal
-            resume_session = stream_session_updates(config, session_id)
+            resume_session, should_stop = stream_session_updates(config, session_id)
 
             if resume_session:
                 # User ran /cc - resume Claude with session
@@ -233,8 +239,8 @@ def run_claude_wrapper(config: Config, args: list[str], reload: bool = False) ->
                 resume_cmd = ['claude', '--resume', resume_session]
                 subprocess.run(resume_cmd, cwd=cwd)
 
-            # Clean up server if we started it
-            if server_proc:
+            # Only clean up server if user explicitly stopped (Ctrl+C)
+            if should_stop and server_proc:
                 _stop_server(server_proc)
             return 0
 

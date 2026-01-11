@@ -61,16 +61,14 @@ def serve(foreground: bool, reload: bool) -> None:
         asyncio.run(run_server(config))
 
 
-def _run_server_subprocess():
-    """Target function for watchfiles - must be at module level for pickling."""
-    import subprocess
-
-    cmd = [sys.executable, '-m', 'glaude', 'serve']
-    subprocess.run(cmd)
-
-
 def _serve_with_reload(config) -> None:
-    """Run server with hot-reload on code changes."""
+    """Run server with hot-reload on code changes.
+
+    Uses graceful shutdown to preserve session state across restarts.
+    """
+    import subprocess
+    import urllib.request
+    import urllib.error
     from pathlib import Path
 
     import watchfiles
@@ -81,13 +79,55 @@ def _serve_with_reload(config) -> None:
     click.echo(f'Starting glaude server on {config.server.host}:{config.server.port} (reload mode)...')
     click.echo(f'Watching: {glaude_dir}')
 
-    # Watch Python files in the glaude directory
-    watchfiles.run_process(
-        glaude_dir,
-        target=_run_server_subprocess,
-        watch_filter=watchfiles.PythonFilter(),
-        callback=lambda changes: click.echo(f'Reloading... (changed: {[str(c[1]) for c in changes]})'),
-    )
+    proc = None
+
+    def start_server():
+        nonlocal proc
+        cmd = [sys.executable, '-m', 'glaude', 'serve']
+        proc = subprocess.Popen(cmd)
+        return proc
+
+    def stop_server_gracefully():
+        """Stop server with graceful shutdown to save session state."""
+        nonlocal proc
+        if proc is None:
+            return
+
+        # First, tell server to save state via HTTP endpoint
+        try:
+            url = f'http://{config.server.host}:{config.server.port}/api/prepare-reload'
+            req = urllib.request.Request(url, method='POST')
+            urllib.request.urlopen(req, timeout=2)
+        except Exception:
+            pass  # Server might already be down
+
+        # Send SIGTERM for graceful shutdown
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        proc = None
+
+    # Start initial server
+    start_server()
+
+    try:
+        # Watch for changes
+        for changes in watchfiles.watch(
+            glaude_dir,
+            watch_filter=watchfiles.PythonFilter(),
+            debounce=1500,
+            step=300,
+        ):
+            changed_files = [str(c[1]) for c in changes]
+            click.echo(f'Reloading... (changed: {changed_files})')
+            stop_server_gracefully()
+            start_server()
+    except KeyboardInterrupt:
+        click.echo('\nStopping...')
+        stop_server_gracefully()
 
 
 @main.command()
@@ -175,10 +215,23 @@ def teleport_hook() -> None:
 
     session_id = hook_input.get('session_id')
     cwd = hook_input.get('cwd', '.')
+    prompt = hook_input.get('prompt', '')
 
     if not session_id:
         click.echo('Error: No session_id in hook input', err=True)
         sys.exit(1)
+
+    # Only teleport if the prompt is exactly "/tg"
+    # The matcher in settings.json should handle this, but we double-check here
+    if prompt.strip() != '/tg':
+        sys.exit(0)
+
+    # Only teleport if called from the glaude wrapper (terminal mode)
+    # The SDK also triggers this hook but we don't want to teleport from TG -> TG
+    wrapper_pid = os.environ.get('GLAUDE_WRAPPER_PID')
+    if not wrapper_pid:
+        # Not running under wrapper - likely SDK triggering the hook
+        sys.exit(0)
 
     config = load_config()
 
