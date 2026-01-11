@@ -1520,6 +1520,20 @@ async def run_server(config: Config) -> None:
     # Start Telegram bot
     async with tg_app:
         await tg_app.start()
+
+        # Register commands with Telegram for menu display
+        await tg_app.bot.set_my_commands([
+            ('start', 'Show help'),
+            ('new', 'Start a new session'),
+            ('cc', 'Return to terminal'),
+            ('status', 'Show session status'),
+            ('mode', 'Change permission mode'),
+            ('model', 'Change AI model'),
+            ('cost', 'Show usage and cost'),
+            ('stop', 'Interrupt current task'),
+            ('cancel', 'Cancel pending teleport'),
+        ])
+
         assert tg_app.updater is not None
         await tg_app.updater.start_polling(
             allowed_updates=['message', 'callback_query', 'edited_message'],
