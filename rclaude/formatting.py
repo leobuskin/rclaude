@@ -150,7 +150,20 @@ def format_tool_call(block: ToolUseBlock) -> str | None:
         query = escape_html(tool_input.get('query', ''))
         return f'🔍 <b>Web search:</b> {query}'
     elif tool_name == 'TodoWrite':
-        return '📋 <b>Updating todos</b>'
+        todos = tool_input.get('todos', [])
+        if not todos:
+            return '📋 <b>Clearing todos</b>'
+        lines = ['📋 <b>Todos:</b>']
+        for todo in todos:
+            status = todo.get('status', 'pending')
+            content = escape_html(todo.get('content', ''))
+            if status == 'completed':
+                lines.append(f'  ✅ <s>{content}</s>')
+            elif status == 'in_progress':
+                lines.append(f'  🔄 {content}')
+            else:  # pending
+                lines.append(f'  ⬜ {content}')
+        return '\n'.join(lines)
     elif tool_name == 'AskUserQuestion':
         return None  # Handled specially
     else:

@@ -1855,17 +1855,17 @@ def create_telegram_app(config: Config) -> Application:
     app = Application.builder().token(config.telegram.bot_token).concurrent_updates(True).build()
     app.bot_data['config'] = config
 
-    app.add_handler(CommandHandler('start', tg_handle_start))
-    app.add_handler(CommandHandler('new', tg_handle_new))
-    app.add_handler(CommandHandler('cc', tg_handle_cc))
-    app.add_handler(CommandHandler('status', tg_handle_status))
-    app.add_handler(CommandHandler('mode', tg_handle_mode))
-    app.add_handler(CommandHandler('model', tg_handle_model))
-    app.add_handler(CommandHandler('cost', tg_handle_cost))
-    app.add_handler(CommandHandler('compact', tg_handle_compact))
-    app.add_handler(CommandHandler('context', tg_handle_context))
-    app.add_handler(CommandHandler('todos', tg_handle_todos))
     app.add_handler(CommandHandler('stop', tg_handle_stop))
+    app.add_handler(CommandHandler('context', tg_handle_context))
+    app.add_handler(CommandHandler('compact', tg_handle_compact))
+    app.add_handler(CommandHandler('cc', tg_handle_cc))
+    app.add_handler(CommandHandler('todos', tg_handle_todos))
+    app.add_handler(CommandHandler('model', tg_handle_model))
+    app.add_handler(CommandHandler('mode', tg_handle_mode))
+    app.add_handler(CommandHandler('cost', tg_handle_cost))
+    app.add_handler(CommandHandler('status', tg_handle_status))
+    app.add_handler(CommandHandler('new', tg_handle_new))
+    app.add_handler(CommandHandler('start', tg_handle_start))
     app.add_handler(CommandHandler('cancel', tg_handle_cancel))
     app.add_handler(CommandHandler('link', tg_handle_link))
     app.add_handler(CallbackQueryHandler(tg_handle_callback))
@@ -1909,17 +1909,17 @@ async def run_server(config: Config) -> None:
 
         # Register commands with Telegram for menu display
         await tg_app.bot.set_my_commands([
-            ('start', 'Show help'),
-            ('new', 'Start a new session'),
-            ('cc', 'Return to terminal'),
-            ('status', 'Show session status'),
-            ('mode', 'Change permission mode'),
-            ('model', 'Change AI model'),
-            ('cost', 'Show usage and cost'),
-            ('compact', 'Compact conversation context'),
-            ('context', 'Show context usage'),
-            ('todos', 'Show TODO items'),
             ('stop', 'Interrupt current task'),
+            ('context', 'Show context usage'),
+            ('compact', 'Compact conversation'),
+            ('cc', 'Return to terminal'),
+            ('todos', 'Show TODO items'),
+            ('model', 'Change AI model'),
+            ('mode', 'Change permission mode'),
+            ('cost', 'Show usage and cost'),
+            ('status', 'Show session status'),
+            ('new', 'Start a new session'),
+            ('start', 'Show help'),
             ('cancel', 'Cancel pending teleport'),
         ])
 
