@@ -34,6 +34,11 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import HookInput, HookContext, SyncHookJSONOutput
 
 from rclaude.settings import Config
+from rclaude.image_handler import (
+    download_telegram_photo,
+    prepare_image_for_claude,
+    cleanup_image_file,
+)
 from rclaude.session import (
     get_session,
     PendingQuestion,
@@ -469,13 +474,22 @@ def create_permission_handler(
         keyboard = create_permission_keyboard(tool_name)
 
         try:
-            await bot.send_message(
-                chat_id=user_id,
-                text=text,
-                reply_markup=keyboard,
-                parse_mode='HTML',
+            await asyncio.wait_for(
+                bot.send_message(
+                    chat_id=user_id,
+                    text=text,
+                    reply_markup=keyboard,
+                    parse_mode='HTML',
+                    disable_notification=False,  # User action required - notify with sound
+                ),
+                timeout=10,
             )
             logger.info('[PERMISSION] Sent permission prompt to Telegram')
+        except asyncio.TimeoutError:
+            logger.warning('[PERMISSION] Timeout sending permission prompt (10s), allowing operation')
+            # On timeout, allow the operation (fail-open for usability)
+            session.pending_permission = None
+            return PermissionResultAllow(updated_input=input_data)
         except Exception as e:
             logger.error(f'Failed to send permission prompt: {e}')
             # On error, allow the operation (fail-open for usability)
@@ -598,23 +612,34 @@ async def handle_teleport(request: web.Request) -> web.Response:
         permission_mode=permission_mode,
     )
 
-    # Notify via Telegram
+    # Notify via Telegram (fire and forget with timeout to avoid blocking HTTP response)
     bot = request.app['telegram_app'].bot
     mode_display = _format_mode_display(permission_mode)
-    try:
-        await bot.send_message(
-            chat_id=user_id,
-            text=f'📱 Session teleported from terminal!\n\n'
-            f'Session: `{session_id[:8]}...`\n'
-            f'Terminal: `{terminal_id[:8]}...`\n'
-            f'Directory: `{cwd}`\n'
-            f'Mode: {mode_display}\n\n'
-            f'Send any message to continue, or /cancel to ignore.',
-            parse_mode='Markdown',
-        )
-    except Exception as e:
-        logger.error(f'Failed to send Telegram notification: {e}')
-        return web.json_response({'error': f'Failed to notify: {e}'}, status=500)
+
+    async def send_notification():
+        """Send notification with timeout to avoid blocking."""
+        try:
+            await asyncio.wait_for(
+                bot.send_message(
+                    chat_id=user_id,
+                    text=f'📱 Session teleported from terminal!\n\n'
+                    f'Session: `{session_id[:8]}...`\n'
+                    f'Terminal: `{terminal_id[:8]}...`\n'
+                    f'Directory: `{cwd}`\n'
+                    f'Mode: {mode_display}\n\n'
+                    f'Send any message to continue, or /cancel to ignore.',
+                    parse_mode='Markdown',
+                    disable_notification=False,  # Enable sound notification for teleport
+                ),
+                timeout=10,
+            )
+        except asyncio.TimeoutError:
+            logger.warning('Timeout sending teleport notification (10s), continuing anyway')
+        except Exception as e:
+            logger.error(f'Failed to send Telegram notification: {e}')
+
+    # Fire and forget - don't block HTTP response while waiting for Telegram API
+    asyncio.create_task(send_notification())
 
     return web.json_response({'ok': True, 'message': 'Teleport initiated'})
 
@@ -1251,6 +1276,7 @@ async def _handle_question_callback(
             await update.effective_chat.send_message(
                 f'{next_q.get("header", "Question")}: {next_q["question"]}',
                 reply_markup=keyboard,
+                disable_notification=True,  # Questions are visible in chat
             )
         else:
             session.pending_question = None
@@ -1322,6 +1348,76 @@ async def _handle_model_callback(
         )
 
 
+async def _handle_message_with_image(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session: UserSession,
+    caption_text: str,
+) -> None:
+    """Handle a message with photo - download, encode, and send to Claude."""
+    assert update.message
+    assert update.effective_user
+    assert session.client
+
+    user_id = update.effective_user.id
+    image_path: Path | None = None
+
+    if not update.message.photo:
+        logger.error('[IMAGE] No photo in message despite has_photo flag')
+        await update.message.reply_text('❌ No image found')
+        return
+
+    try:
+        # Show processing indicator
+        await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
+
+        # Download image from Telegram
+        logger.info('[IMAGE] Downloading photo from Telegram...')
+        image_path = await download_telegram_photo(context.bot, update.message.photo, user_id)
+
+        if not image_path:
+            await update.message.reply_text('❌ Failed to download image')
+            return
+
+        # Prepare image for Claude (encode to base64)
+        logger.info('[IMAGE] Preparing image for Claude...')
+        image_data = await prepare_image_for_claude(image_path)
+
+        if not image_data:
+            await update.message.reply_text('❌ Failed to process image')
+            cleanup_image_file(image_path)
+            return
+
+        base64_str, mime_type = image_data
+        logger.info(f'[IMAGE] Image prepared: {mime_type}, {len(base64_str)} chars base64')
+
+        # Show uploading status
+        await update.message.reply_text('📸 Image received, analyzing...')
+
+        # Build message with image data as base64 URI
+        # The SDK's query() method expects a string, not content blocks
+        image_uri = f'data:{mime_type};base64,{base64_str}'
+
+        if caption_text.strip():
+            message = f'{caption_text}\n\n{image_uri}'
+        else:
+            message = image_uri
+
+        # Send to Claude as a text message with embedded image data
+        logger.info('[IMAGE] Sending to Claude...')
+        await session.client.query(message)
+        await _process_response(update, context, session)
+
+    except Exception as e:
+        logger.error(f'[IMAGE] Error handling image: {e}', exc_info=True)
+        await update.message.reply_text(f'❌ Error processing image: {e}')
+
+    finally:
+        # Cleanup temp image file
+        if image_path and image_path.exists():
+            cleanup_image_file(image_path)
+
+
 async def _process_response(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1337,6 +1433,8 @@ async def _process_response(
     response_text = ''
     # Track tool call messages for editing with results: tool_use_id -> (message_id, text)
     tool_messages: dict[str, tuple[int, str]] = {}
+    # Track whether we've received ResultMessage (signals task completion)
+    is_final_message = False
 
     try:
         async for message in session.client.receive_response():
@@ -1346,9 +1444,9 @@ async def _process_response(
                         response_text += block.text
 
                     elif isinstance(block, ToolUseBlock):
-                        # Send any accumulated text first
+                        # Send any accumulated text first (silently - intermediate processing)
                         if response_text.strip():
-                            await send_text(update, response_text)
+                            await send_text(update, response_text, disable_notification=True)
                             await session.update_queue.put(SessionUpdate('text', response_text))
                             response_text = ''
 
@@ -1366,13 +1464,14 @@ async def _process_response(
                                     f'<b>{first_q.get("header", "Question")}:</b> {first_q["question"]}',
                                     reply_markup=keyboard,
                                     parse_mode='HTML',
+                                    disable_notification=True,  # Questions are visible in chat
                                 )
                                 await session.update_queue.put(SessionUpdate('question', first_q['question']))
                                 session.is_processing = False
                                 return
 
-                        # Send tool call as formatted message and track for result editing
-                        msg_info = await send_tool_call(update, block)
+                        # Send tool call as formatted message and track for result editing (silently)
+                        msg_info = await send_tool_call(update, block, disable_notification=True)
                         if msg_info and block.id:
                             tool_messages[block.id] = msg_info
                         tool_desc = (
@@ -1384,9 +1483,9 @@ async def _process_response(
                 # Tool results come in UserMessage
                 for block in message.content:
                     if isinstance(block, ToolResultBlock):
-                        # Find the original tool call message to edit
+                        # Find the original tool call message to edit (send silently)
                         msg_info = tool_messages.get(block.tool_use_id)
-                        await send_tool_result(update, block, msg_info)
+                        await send_tool_result(update, block, msg_info, disable_notification=True)
                         # Don't send full tool results to terminal (too verbose)
 
             elif isinstance(message, ResultMessage):
@@ -1408,24 +1507,28 @@ async def _process_response(
                     session.usage.total_output_tokens += message.usage.get('output_tokens', 0)
                 logger.info(f'[USAGE] Cost: ${message.total_cost_usd or 0:.4f}, Total: ${session.usage.total_cost_usd:.4f}')
 
+                # Mark that the next message should be the final one (with sound notification)
+                is_final_message = True
+
     except Exception as e:
         logger.error(f'Error processing response: {e}')
         response_text += f'\n\n❌ Error: {e}'
+        # Errors are also final messages (should notify with sound)
+        is_final_message = True
 
     finally:
         session.is_processing = False
 
-    # Send any remaining text
+    # Send any remaining text - with sound notification if this is the final message
     if response_text.strip():
-        await send_text(update, response_text)
+        await send_text(update, response_text, disable_notification=not is_final_message)
         await session.update_queue.put(SessionUpdate('text', response_text))
 
 
 async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages."""
+    """Handle text and photo messages."""
     assert update.effective_user
     assert update.message
-    assert update.message.text
     assert update.message.chat
     assert context.user_data is not None
 
@@ -1437,7 +1540,14 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     session = get_session(user_id)
-    text = update.message.text
+
+    # Extract text and check for photos
+    text = update.message.text or update.message.caption or ''
+    has_photo = bool(update.message.photo)  # Check if photo list is non-empty
+
+    # Handle case where photo has no caption/text
+    if has_photo and not text:
+        text = ''
 
     # Check for pending teleport
     if user_id in _pending_teleports:
@@ -1549,6 +1659,7 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text(
                 f'{next_q.get("header", "Question")}: {next_q["question"]}',
                 reply_markup=keyboard,
+                disable_notification=True,  # Questions are visible in chat
             )
         else:
             session.pending_question = None
@@ -1596,8 +1707,12 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if resume_session:
                 await update.message.reply_text('✓ Session resumed after reload.')
 
-        await session.client.query(text)
-        await _process_response(update, context, session)
+        # Handle image if present
+        if has_photo:
+            await _handle_message_with_image(update, context, session, text)
+        else:
+            await session.client.query(text)
+            await _process_response(update, context, session)
 
     except Exception as e:
         logger.error(f'Error: {e}', exc_info=True)
@@ -1642,7 +1757,8 @@ def create_telegram_app(config: Config) -> Application:
     app.add_handler(CommandHandler('cancel', tg_handle_cancel))
     app.add_handler(CommandHandler('link', tg_handle_link))
     app.add_handler(CallbackQueryHandler(tg_handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_handle_message))
+    # Handle both text messages and photos (with optional captions)
+    app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.PHOTO, tg_handle_message))
 
     # Debug: catch ALL updates in a separate group
     from telegram.ext import TypeHandler
@@ -1714,11 +1830,16 @@ async def run_server(config: Config) -> None:
 
                 # Notify user to continue
                 try:
-                    await tg_app.bot.send_message(
-                        chat_id=user_id,
-                        text='🔄 Server reloaded. Send any message to reconnect to your session.',
+                    await asyncio.wait_for(
+                        tg_app.bot.send_message(
+                            chat_id=user_id,
+                            text='🔄 Server reloaded. Send any message to reconnect to your session.',
+                        ),
+                        timeout=10,
                     )
                     logger.info(f'Notified user {user_id} to reconnect after hot-reload')
+                except asyncio.TimeoutError:
+                    logger.warning(f'Timeout notifying user {user_id} after reload (10s), continuing anyway')
                 except Exception as e:
                     logger.warning(f'Failed to notify user after reload: {e}')
 
