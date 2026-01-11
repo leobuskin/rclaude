@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
     UserMessage,
+    SystemMessage,
     TextBlock,
     ToolUseBlock,
     ToolResultBlock,
@@ -41,6 +43,7 @@ from rclaude.session import (
     UserSession,
     SessionUpdate,
     PermissionMode,
+    ContextUsage,
     save_session_state,
     load_session_state,
     clear_session_state,
@@ -179,6 +182,90 @@ def _format_mode_short(mode: str) -> str:
         'bypassPermissions': '⚠️',
     }
     return short.get(mode, '🔒')
+
+
+def _format_model_short(model: str | None) -> str:
+    """Format model name as short label."""
+    if not model:
+        return '⚡ sonnet'
+    m = model.lower()
+    if 'opus' in m:
+        return '🧠 opus'
+    if 'haiku' in m:
+        return '🚀 haiku'
+    return f'⚡ {model}'
+
+
+def _parse_context_output(text: str) -> ContextUsage | None:
+    """Parse /context command output to extract token usage.
+
+    Expected format:
+        Tokens: 24.4k / 200.0k (12%)
+    """
+    # Match pattern like "Tokens: 24.4k / 200.0k (12%)"
+    match = re.search(r'Tokens:\s*([\d.]+)k?\s*/\s*([\d.]+)k?\s*\((\d+)%\)', text)
+    if not match:
+        return None
+
+    used_str, max_str, percent_str = match.groups()
+
+    # Parse token counts (handle 'k' suffix)
+    def parse_tokens(s: str) -> int:
+        val = float(s)
+        # If the match included 'k' in the pattern or value is small, multiply
+        if val < 1000:  # Likely in thousands
+            return int(val * 1000)
+        return int(val)
+
+    return ContextUsage(
+        tokens_used=parse_tokens(used_str),
+        tokens_max=parse_tokens(max_str),
+        percent_used=int(percent_str),
+    )
+
+
+def _format_pinned_status(session: 'UserSession') -> str:
+    """Format the pinned status message content."""
+    mode_icon = _format_mode_short(session.permission_mode)
+    model_display = _format_model_short(session.current_model)
+
+    parts = [f'{mode_icon} <b>{session.permission_mode}</b>', model_display]
+
+    # Add context usage if available
+    if session.context.tokens_max > 0:
+        parts.append(f'📝 {session.context.percent_used}%')
+
+    # Add cost if available
+    if session.usage.total_cost_usd > 0:
+        parts.append(f'💰 ${session.usage.total_cost_usd:.4f}')
+
+    return ' | '.join(parts)
+
+
+async def _update_pinned_message(
+    bot: Bot,
+    chat_id: int,
+    session: 'UserSession',
+) -> None:
+    """Update the pinned status message, creating it if needed."""
+    text = _format_pinned_status(session)
+
+    try:
+        if session.pinned_message_id:
+            # Try to update existing message
+            await bot.edit_message_text(
+                text=text,
+                chat_id=chat_id,
+                message_id=session.pinned_message_id,
+                parse_mode='HTML',
+            )
+        else:
+            # Create new message and pin it
+            msg = await bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML')
+            await msg.pin(disable_notification=True)
+            session.pinned_message_id = msg.message_id
+    except Exception as e:
+        logger.warning(f'Failed to update pinned message: {e}')
 
 
 # Tools that require interactive approval in default mode
@@ -801,16 +888,21 @@ async def tg_handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await update.message.reply_text(
         '📱 rclaude - Claude Code Remote\n\n'
-        'Commands:\n'
-        '/start - Show this help\n'
+        '<b>Session:</b>\n'
         '/new - Start a new session\n'
         '/cc - Return to terminal\n'
         '/status - Show session status\n'
-        '/mode - Change permission mode\n'
-        '/model - Change AI model\n'
-        '/cost - Show usage and cost\n'
         '/stop - Interrupt current task\n\n'
-        'Or just send a message to interact with Claude.'
+        '<b>Settings:</b>\n'
+        '/mode - Change permission mode\n'
+        '/model - Change AI model\n\n'
+        '<b>Context:</b>\n'
+        '/context - Show context usage\n'
+        '/compact - Compact conversation\n'
+        '/todos - Show TODO items\n'
+        '/cost - Show usage and cost\n\n'
+        'Or just send a message to interact with Claude.',
+        parse_mode='HTML',
     )
 
 
@@ -930,6 +1022,9 @@ async def tg_handle_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f'✓ Mode changed to: {_format_mode_display(new_mode)}',
                 parse_mode='HTML',
             )
+            # Update pinned status message
+            assert update.effective_chat
+            await _update_pinned_message(context.bot, update.effective_chat.id, session)
             return
         else:
             await update.message.reply_text(f'Unknown mode: {mode_arg}\n\nValid modes: default, accept, plan, dangerous')
@@ -972,6 +1067,9 @@ async def tg_handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await session.client.set_model(new_model)
                 session.current_model = new_model
                 await update.message.reply_text(f'✓ Model changed to: <b>{new_model}</b>', parse_mode='HTML')
+                # Update pinned status message
+                assert update.effective_chat
+                await _update_pinned_message(context.bot, update.effective_chat.id, session)
             except Exception as e:
                 await update.message.reply_text(f'Failed to change model: {e}')
         else:
@@ -1021,6 +1119,83 @@ async def tg_handle_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lines.append(f'\n<i>Last response: ${usage.last_response_cost:.4f}</i>')
 
     await update.message.reply_text('\n'.join(lines), parse_mode='HTML')
+
+
+async def _fetch_context_silently(session: UserSession) -> None:
+    """Fetch context usage without displaying output."""
+    if not session.client:
+        return
+
+    try:
+        await session.client.query('/context')
+        # Process messages silently, only extracting context
+        async for message in session.client.receive_response():
+            if isinstance(message, SystemMessage):
+                data = message.data
+                text_content = None
+                if 'message' in data:
+                    text_content = data['message']
+                elif 'text' in data:
+                    text_content = data['text']
+                elif 'content' in data:
+                    text_content = data['content']
+                elif 'result' in data:
+                    text_content = data['result']
+
+                if text_content:
+                    context_usage = _parse_context_output(str(text_content))
+                    if context_usage:
+                        session.context = context_usage
+                        logger.info(f'[CONTEXT] Fetched: {context_usage.tokens_used}/{context_usage.tokens_max} ({context_usage.percent_used}%)')
+    except Exception as e:
+        logger.warning(f'Failed to fetch context: {e}')
+
+
+async def _proxy_slash_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    command: str,
+) -> None:
+    """Proxy a slash command to Claude."""
+    assert update.effective_user
+    assert update.message
+
+    config: Config = context.bot_data['config']
+    if update.effective_user.id != config.telegram.user_id:
+        return
+
+    session = get_session(update.effective_user.id)
+
+    if not session.client:
+        await update.message.reply_text('No active session. Send a message to start one.')
+        return
+
+    # Send the slash command as a query
+    await update.message.reply_text(f'⏳ Running {command}...')
+    try:
+        await session.client.query(command)
+        await _process_response(update, context, session)
+    except Exception as e:
+        await update.message.reply_text(f'Failed: {e}')
+
+
+async def tg_handle_compact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /compact command - compact conversation context."""
+    text = (update.message.text or '').strip() if update.message else ''
+    # Pass any arguments after /compact
+    parts = text.split(maxsplit=1)
+    command = f'/compact {parts[1]}' if len(parts) > 1 else '/compact'
+    await _proxy_slash_command(update, context, command)
+
+
+async def tg_handle_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /context command - show context usage."""
+    await _proxy_slash_command(update, context, '/context')
+
+
+async def tg_handle_todos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /todos command - show current TODO items."""
+    await _proxy_slash_command(update, context, '/todos')
 
 
 async def tg_handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1292,6 +1467,9 @@ async def _handle_mode_callback(
         f'✓ Mode changed to: {_format_mode_display(mode)}',
         parse_mode='HTML',
     )
+    # Update pinned status message
+    assert update.effective_chat
+    await _update_pinned_message(context.bot, update.effective_chat.id, session)
 
 
 async def _handle_model_callback(
@@ -1312,6 +1490,9 @@ async def _handle_model_callback(
             await session.client.set_model(model)
             session.current_model = model
             await query.edit_message_text(f'✓ Model changed to: <b>{model}</b>', parse_mode='HTML')
+            # Update pinned status message
+            assert update.effective_chat
+            await _update_pinned_message(context.bot, update.effective_chat.id, session)
         except Exception as e:
             await query.edit_message_text(f'Failed to change model: {e}')
     else:
@@ -1389,6 +1570,31 @@ async def _process_response(
                         await send_tool_result(update, block, msg_info)
                         # Don't send full tool results to terminal (too verbose)
 
+            elif isinstance(message, SystemMessage):
+                # Handle system messages (slash command outputs, etc.)
+                logger.info(f'[SYSTEM] subtype={message.subtype} data={message.data}')
+                data = message.data
+                # Extract text content from various system message formats
+                text_content = None
+                if 'message' in data:
+                    text_content = data['message']
+                elif 'text' in data:
+                    text_content = data['text']
+                elif 'content' in data:
+                    text_content = data['content']
+                elif 'result' in data:
+                    text_content = data['result']
+
+                if text_content:
+                    text_str = str(text_content)
+                    response_text += text_str
+
+                    # Try to parse context usage from /context output
+                    context_usage = _parse_context_output(text_str)
+                    if context_usage:
+                        session.context = context_usage
+                        logger.info(f'[CONTEXT] Parsed: {context_usage.tokens_used}/{context_usage.tokens_max} ({context_usage.percent_used}%)')
+
             elif isinstance(message, ResultMessage):
                 if message.is_error and message.result:
                     response_text += f'\n\n❌ Error: {message.result}'
@@ -1419,6 +1625,10 @@ async def _process_response(
     if response_text.strip():
         await send_text(update, response_text)
         await session.update_queue.put(SessionUpdate('text', response_text))
+
+    # Update pinned status message (cost/context may have changed)
+    assert update.effective_chat
+    await _update_pinned_message(context.bot, update.effective_chat.id, session)
 
 
 async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1498,22 +1708,18 @@ async def tg_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 else:
                     raise
 
-            # Send session start message with mode info
-            mode_display = _format_mode_display(session.permission_mode)
-            if resumable:
-                start_msg = f'✓ Session resumed\nMode: {mode_display}'
-            else:
-                start_msg = f'✓ Connected (fresh session)\nMode: {mode_display}'
-            await update.message.reply_text(start_msg, parse_mode='HTML')
+            # Fetch context usage silently
+            await _fetch_context_silently(session)
 
-            # Send and pin meta-message with session info (if not default mode)
-            if session.permission_mode != 'default':
-                meta_text = f'{_format_mode_short(session.permission_mode)} <b>{session.permission_mode}</b> mode active'
-                try:
-                    meta_msg = await update.message.reply_text(meta_text, parse_mode='HTML')
-                    await meta_msg.pin(disable_notification=True)
-                except Exception as pin_err:
-                    logger.warning(f'Failed to pin meta message: {pin_err}')
+            # Send session start message
+            if resumable:
+                await update.message.reply_text('✓ Session resumed')
+            else:
+                await update.message.reply_text('✓ Connected (fresh session)')
+
+            # Create/update pinned status message
+            assert update.effective_chat
+            await _update_pinned_message(context.bot, update.effective_chat.id, session)
         except Exception as e:
             logger.error(f'[DEBUG] Teleport failed: {e}')
             await update.message.reply_text(f'Failed to connect: {e}')
@@ -1638,6 +1844,9 @@ def create_telegram_app(config: Config) -> Application:
     app.add_handler(CommandHandler('mode', tg_handle_mode))
     app.add_handler(CommandHandler('model', tg_handle_model))
     app.add_handler(CommandHandler('cost', tg_handle_cost))
+    app.add_handler(CommandHandler('compact', tg_handle_compact))
+    app.add_handler(CommandHandler('context', tg_handle_context))
+    app.add_handler(CommandHandler('todos', tg_handle_todos))
     app.add_handler(CommandHandler('stop', tg_handle_stop))
     app.add_handler(CommandHandler('cancel', tg_handle_cancel))
     app.add_handler(CommandHandler('link', tg_handle_link))
@@ -1689,6 +1898,9 @@ async def run_server(config: Config) -> None:
             ('mode', 'Change permission mode'),
             ('model', 'Change AI model'),
             ('cost', 'Show usage and cost'),
+            ('compact', 'Compact conversation context'),
+            ('context', 'Show context usage'),
+            ('todos', 'Show TODO items'),
             ('stop', 'Interrupt current task'),
             ('cancel', 'Cancel pending teleport'),
         ])

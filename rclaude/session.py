@@ -46,6 +46,15 @@ class SessionUpdate:
 
 
 @dataclass
+class ContextUsage:
+    """Tracks context window usage."""
+
+    tokens_used: int = 0
+    tokens_max: int = 0
+    percent_used: int = 0
+
+
+@dataclass
 class SessionUsage:
     """Tracks usage and cost for a session."""
 
@@ -72,6 +81,8 @@ class UserSession:
     permission_mode: PermissionMode = 'default'  # Current permission mode
     current_model: str | None = None  # Current model (sonnet, opus, haiku, or full name)
     usage: SessionUsage = field(default_factory=SessionUsage)  # Cost/usage tracking
+    context: ContextUsage = field(default_factory=ContextUsage)  # Context window tracking
+    pinned_message_id: int | None = None  # Pinned status message for updates
     # Queue for streaming updates to terminal
     update_queue: asyncio.Queue[SessionUpdate] = field(default_factory=asyncio.Queue)
 
