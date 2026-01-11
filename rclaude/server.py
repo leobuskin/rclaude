@@ -1,4 +1,4 @@
-"""Combined HTTP + Telegram server for glaude."""
+"""Combined HTTP + Telegram server for rclaude."""
 
 import asyncio
 import json
@@ -31,8 +31,8 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import HookInput, HookContext, SyncHookJSONOutput
 
-from glaude.settings import Config
-from glaude.session import (
+from rclaude.settings import Config
+from rclaude.session import (
     get_session,
     PendingQuestion,
     PendingPermission,
@@ -42,7 +42,7 @@ from glaude.session import (
     load_session_state,
     clear_session_state,
 )
-from glaude.formatting import (
+from rclaude.formatting import (
     send_text,
     send_tool_call,
     send_tool_result,
@@ -70,7 +70,7 @@ def _get_shutdown_event() -> asyncio.Event:
 
 def _get_watcher_pid_file(wrapper_pid: int) -> Path:
     """Get the watcher PID file path for a given wrapper."""
-    return Path(f'/tmp/glaude-watcher-{wrapper_pid}.pid')
+    return Path(f'/tmp/rclaude-watcher-{wrapper_pid}.pid')
 
 
 def _trigger_shutdown() -> None:
@@ -82,7 +82,7 @@ def _trigger_shutdown() -> None:
     logger.info('[SHUTDOWN] Server shutdown triggered')
 
     # Kill watcher process if we have its PID (based on wrapper PID from env)
-    wrapper_pid = os.environ.get('GLAUDE_WRAPPER_PID')
+    wrapper_pid = os.environ.get('RCLAUDE_WRAPPER_PID')
     if wrapper_pid:
         pid_file = _get_watcher_pid_file(int(wrapper_pid))
         if pid_file.exists():
@@ -286,7 +286,7 @@ def can_resume_session(session_id: str, cwd: str) -> bool:
         return False
 
 
-logger = logging.getLogger('glaude')
+logger = logging.getLogger('rclaude')
 
 
 @dataclass
@@ -525,7 +525,7 @@ async def tg_handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     await update.message.reply_text(
-        '📱 Glaude - Claude Code Remote\n\n'
+        '📱 rclaude - Claude Code Remote\n\n'
         'Commands:\n'
         '/start - Show this help\n'
         '/new - Start a new session\n'

@@ -1,12 +1,12 @@
-"""CLI commands for glaude."""
+"""CLI commands for rclaude."""
 
 import asyncio
 import sys
 
 import click
 
-from glaude import __version__
-from glaude.settings import load_config, CONFIG_FILE
+from rclaude import __version__
+from rclaude.settings import load_config, CONFIG_FILE
 
 
 @click.group(invoke_without_command=True)
@@ -15,7 +15,7 @@ from glaude.settings import load_config, CONFIG_FILE
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
 @click.pass_context
 def main(ctx: click.Context, version: bool, reload: bool, verbose: bool) -> None:
-    """Glaude - Remote Claude Code control via Telegram.
+    """rclaude - Remote Claude Code control via Telegram.
 
     Run without arguments to start Claude Code with teleportation support.
     """
@@ -25,7 +25,7 @@ def main(ctx: click.Context, version: bool, reload: bool, verbose: bool) -> None
         logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
     if version:
-        click.echo(f'glaude {__version__}')
+        click.echo(f'rclaude {__version__}')
         return
 
     if ctx.invoked_subcommand is None:
@@ -36,7 +36,7 @@ def main(ctx: click.Context, version: bool, reload: bool, verbose: bool) -> None
 @main.command()
 def setup() -> None:
     """Interactive setup wizard."""
-    from glaude.setup_wizard import run_setup
+    from rclaude.setup_wizard import run_setup
 
     run_setup()
 
@@ -46,7 +46,7 @@ def setup() -> None:
 @click.option('--reload', '-r', is_flag=True, help='Auto-reload on code changes (dev mode)')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
 def serve(foreground: bool, reload: bool, verbose: bool) -> None:
-    """Start the glaude server (HTTP + Telegram bot)."""
+    """Start the rclaude server (HTTP + Telegram bot)."""
     if verbose:
         import logging
 
@@ -55,15 +55,15 @@ def serve(foreground: bool, reload: bool, verbose: bool) -> None:
     config = load_config()
 
     if not config.is_configured():
-        click.echo('Glaude is not configured. Run: glaude setup')
+        click.echo('rclaude is not configured. Run: rclaude setup')
         sys.exit(1)
 
     if reload:
         _serve_with_reload(config, verbose=verbose)
     else:
-        from glaude.server import run_server
+        from rclaude.server import run_server
 
-        click.echo(f'Starting glaude server on {config.server.host}:{config.server.port}...')
+        click.echo(f'Starting rclaude server on {config.server.host}:{config.server.port}...')
         asyncio.run(run_server(config))
 
 
@@ -79,17 +79,17 @@ def _serve_with_reload(config, verbose: bool = False) -> None:
 
     import watchfiles
 
-    # Find the glaude package directory
-    glaude_dir = Path(__file__).parent
+    # Find the rclaude package directory
+    rclaude_dir = Path(__file__).parent
 
-    click.echo(f'Starting glaude server on {config.server.host}:{config.server.port} (reload mode)...')
-    click.echo(f'Watching: {glaude_dir}')
+    click.echo(f'Starting rclaude server on {config.server.host}:{config.server.port} (reload mode)...')
+    click.echo(f'Watching: {rclaude_dir}')
 
     proc = None
 
     def start_server():
         nonlocal proc
-        cmd = [sys.executable, '-m', 'glaude', 'serve']
+        cmd = [sys.executable, '-m', 'rclaude', 'serve']
         if verbose:
             cmd.append('--verbose')
         proc = subprocess.Popen(cmd)
@@ -124,7 +124,7 @@ def _serve_with_reload(config, verbose: bool = False) -> None:
     try:
         # Watch for changes
         for changes in watchfiles.watch(
-            glaude_dir,
+            rclaude_dir,
             watch_filter=watchfiles.PythonFilter(),
             debounce=1500,
             step=300,
@@ -150,25 +150,25 @@ def run(reload: bool, verbose: bool, args: tuple[str, ...]) -> None:
     config = load_config()
 
     if not config.is_configured():
-        click.echo('Glaude is not configured. Run: glaude setup')
+        click.echo('rclaude is not configured. Run: rclaude setup')
         sys.exit(1)
 
-    from glaude.wrapper import run_claude_wrapper
+    from rclaude.wrapper import run_claude_wrapper
 
     sys.exit(run_claude_wrapper(config, list(args), reload=reload, verbose=verbose))
 
 
 @main.command()
 def status() -> None:
-    """Show glaude status."""
+    """Show rclaude status."""
     config = load_config()
 
-    click.echo('Glaude Status')
+    click.echo('rclaude Status')
     click.echo('─' * 40)
 
     if not CONFIG_FILE.exists():
         click.echo('Config: Not configured')
-        click.echo('\nRun: glaude setup')
+        click.echo('\nRun: rclaude setup')
         return
 
     click.echo(f'Config: {CONFIG_FILE}')
@@ -213,7 +213,7 @@ def teleport_hook() -> None:
     import urllib.error
     from pathlib import Path
 
-    from glaude.wrapper import is_server_running, start_server_background
+    from rclaude.wrapper import is_server_running, start_server_background
 
     # Read hook input from stdin
     try:
@@ -235,9 +235,9 @@ def teleport_hook() -> None:
     if prompt.strip() != '/tg':
         sys.exit(0)
 
-    # Only teleport if called from the glaude wrapper (terminal mode)
+    # Only teleport if called from the rclaude wrapper (terminal mode)
     # The SDK also triggers this hook but we don't want to teleport from TG -> TG
-    wrapper_pid = os.environ.get('GLAUDE_WRAPPER_PID')
+    wrapper_pid = os.environ.get('RCLAUDE_WRAPPER_PID')
     if not wrapper_pid:
         # Not running under wrapper - likely SDK triggering the hook
         sys.exit(0)
@@ -247,8 +247,8 @@ def teleport_hook() -> None:
     # Auto-start server if not running
     if not is_server_running(config):
         try:
-            reload_mode = os.environ.get('GLAUDE_RELOAD') == '1'
-            verbose_mode = os.environ.get('GLAUDE_VERBOSE') == '1'
+            reload_mode = os.environ.get('RCLAUDE_RELOAD') == '1'
+            verbose_mode = os.environ.get('RCLAUDE_VERBOSE') == '1'
             start_server_background(config, reload=reload_mode, verbose=verbose_mode)
         except RuntimeError as e:
             click.echo(f'Error: Failed to start server - {e}', err=True)
@@ -278,12 +278,12 @@ def teleport_hook() -> None:
         sys.exit(1)
 
     # Signal the wrapper to switch to tail mode
-    wrapper_pid = os.environ.get('GLAUDE_WRAPPER_PID')
+    wrapper_pid = os.environ.get('RCLAUDE_WRAPPER_PID')
     if wrapper_pid:
         try:
             pid = int(wrapper_pid)
             # Write signal file with session info
-            signal_file = Path(f'/tmp/glaude-{pid}.signal')
+            signal_file = Path(f'/tmp/rclaude-{pid}.signal')
             signal_file.write_text(json.dumps({'session_id': session_id, 'cwd': cwd}))
             # Send signal to wrapper
             os.kill(pid, signal.SIGUSR1)
@@ -294,12 +294,12 @@ def teleport_hook() -> None:
 
 @main.command()
 def uninstall() -> None:
-    """Remove glaude configuration and hooks."""
+    """Remove rclaude configuration and hooks."""
     import json
 
-    from glaude.settings import CONFIG_DIR, HOOK_DIR, CLAUDE_SETTINGS_FILE
+    from rclaude.settings import CONFIG_DIR, HOOK_DIR, CLAUDE_SETTINGS_FILE
 
-    click.confirm('This will remove all glaude configuration. Continue?', abort=True)
+    click.confirm('This will remove all rclaude configuration. Continue?', abort=True)
 
     # Remove slash command
     hook_file = HOOK_DIR / 'tg.md'
@@ -339,4 +339,4 @@ def uninstall() -> None:
         except OSError:
             click.echo(f'Note: {CONFIG_DIR} not empty, left in place')
 
-    click.echo('Glaude uninstalled.')
+    click.echo('rclaude uninstalled.')

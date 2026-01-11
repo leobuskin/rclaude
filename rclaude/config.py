@@ -1,7 +1,7 @@
 """Configuration and environment loading.
 
 This module provides backward compatibility by loading from:
-1. ~/.config/glaude/config.toml (new setup)
+1. ~/.config/rclaude/config.toml (new setup)
 2. .env file (legacy)
 """
 
@@ -11,7 +11,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from glaude.settings import load_config as load_toml_config, CONFIG_FILE
+from rclaude.settings import load_config as load_toml_config, CONFIG_FILE
 
 # Load .env from project root (legacy support)
 _project_root = Path(__file__).parent.parent
@@ -22,7 +22,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
 )
-logger = logging.getLogger('glaude')
+logger = logging.getLogger('rclaude')
 
 # Telegram message limit
 MAX_MESSAGE_LENGTH = 4000

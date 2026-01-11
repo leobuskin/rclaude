@@ -1,6 +1,6 @@
-"""Configuration management for glaude.
+"""Configuration management for rclaude.
 
-Config is stored in ~/.config/glaude/config.toml
+Config is stored in ~/.config/rclaude/config.toml
 """
 
 import tomllib
@@ -10,7 +10,7 @@ from pathlib import Path
 import tomli_w
 
 
-CONFIG_DIR = Path.home() / '.config' / 'glaude'
+CONFIG_DIR = Path.home() / '.config' / 'rclaude'
 CONFIG_FILE = CONFIG_DIR / 'config.toml'
 HOOK_DIR = Path.home() / '.claude' / 'commands'
 CLAUDE_SETTINGS_FILE = Path.home() / '.claude' / 'settings.json'
@@ -41,7 +41,7 @@ class Config:
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
 
     def is_configured(self) -> bool:
-        """Check if glaude is fully configured."""
+        """Check if rclaude is fully configured."""
         return bool(self.telegram.bot_token and self.telegram.user_id)
 
     def to_dict(self) -> dict:

@@ -1,6 +1,6 @@
 """Authorization logic."""
 
-from glaude.config import ALLOWED_USERS
+from rclaude.config import ALLOWED_USERS
 
 
 def is_authorized(user_id: int) -> bool:

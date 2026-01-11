@@ -14,16 +14,16 @@ from pathlib import Path
 
 import pexpect
 
-from glaude.settings import Config
+from rclaude.settings import Config
 
 
 def get_signal_file() -> Path:
     """Get the signal file path for this wrapper instance."""
-    return Path(f'/tmp/glaude-{os.getpid()}.signal')
+    return Path(f'/tmp/rclaude-{os.getpid()}.signal')
 
 
 def is_server_running(config: Config) -> bool:
-    """Check if the glaude server is running."""
+    """Check if the rclaude server is running."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     result = sock.connect_ex((config.server.host, config.server.port))
     sock.close()
@@ -31,15 +31,15 @@ def is_server_running(config: Config) -> bool:
 
 
 def start_server_background(config: Config, reload: bool = False, verbose: bool = False) -> subprocess.Popen:
-    """Start the glaude server in the background."""
-    # Find the glaude executable
+    """Start the rclaude server in the background."""
+    # Find the rclaude executable
     import shutil
 
-    glaude_path = shutil.which('glaude')
-    if glaude_path:
-        cmd = [glaude_path, 'serve']
+    rclaude_path = shutil.which('rclaude')
+    if rclaude_path:
+        cmd = [rclaude_path, 'serve']
     else:
-        cmd = [sys.executable, '-m', 'glaude', 'serve']
+        cmd = [sys.executable, '-m', 'rclaude', 'serve']
 
     if reload:
         cmd.append('--reload')
@@ -57,9 +57,9 @@ def start_server_background(config: Config, reload: bool = False, verbose: bool 
     )
 
     # Save watcher PID so server can kill it on shutdown (for reload mode)
-    wrapper_pid = os.environ.get('GLAUDE_WRAPPER_PID')
+    wrapper_pid = os.environ.get('RCLAUDE_WRAPPER_PID')
     if wrapper_pid and reload:
-        pid_file = Path(f'/tmp/glaude-watcher-{wrapper_pid}.pid')
+        pid_file = Path(f'/tmp/rclaude-watcher-{wrapper_pid}.pid')
         pid_file.write_text(str(proc.pid))
 
     # Wait for server to be ready (longer timeout for reload mode due to watchfiles startup)
@@ -69,7 +69,7 @@ def start_server_background(config: Config, reload: bool = False, verbose: bool 
             return proc
         time.sleep(0.1)
 
-    raise RuntimeError('Failed to start glaude server')
+    raise RuntimeError('Failed to start rclaude server')
 
 
 def stream_session_updates(config: Config, session_id: str) -> tuple[str | None, bool]:
@@ -159,11 +159,11 @@ def run_claude_wrapper(config: Config, args: list[str], reload: bool = False, ve
 
     # Set env vars so hook can find us and know our settings
     env = os.environ.copy()
-    env['GLAUDE_WRAPPER_PID'] = str(os.getpid())
+    env['RCLAUDE_WRAPPER_PID'] = str(os.getpid())
     if reload:
-        env['GLAUDE_RELOAD'] = '1'
+        env['RCLAUDE_RELOAD'] = '1'
     if verbose:
-        env['GLAUDE_VERBOSE'] = '1'
+        env['RCLAUDE_VERBOSE'] = '1'
 
     # Track state for teleport cycles
     teleport_data: dict | None = None

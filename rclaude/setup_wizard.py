@@ -1,4 +1,4 @@
-"""Interactive setup wizard for glaude."""
+"""Interactive setup wizard for rclaude."""
 
 import asyncio
 import json
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import click
 
-from glaude.settings import (
+from rclaude.settings import (
     Config,
     save_config,
     load_config,
@@ -27,7 +27,7 @@ DEFAULT_SERVER_PORT = 7680
 
 
 def is_server_running(host: str = DEFAULT_SERVER_HOST, port: int = DEFAULT_SERVER_PORT) -> bool:
-    """Check if the glaude server is running."""
+    """Check if the rclaude server is running."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     result = sock.connect_ex((host, port))
     sock.close()
@@ -117,11 +117,11 @@ def install_hook() -> bool:
         with open(CLAUDE_SETTINGS_FILE) as f:
             settings = json.load(f)
 
-    # Find glaude executable path
-    glaude_path = shutil.which('glaude')
-    if not glaude_path:
-        # Fallback to python -m glaude
-        glaude_path = f'{sys.executable} -m glaude'
+    # Find rclaude executable path
+    rclaude_path = shutil.which('rclaude')
+    if not rclaude_path:
+        # Fallback to python -m rclaude
+        rclaude_path = f'{sys.executable} -m rclaude'
 
     # Define our hook
     tg_hook = {
@@ -129,7 +129,7 @@ def install_hook() -> bool:
         'hooks': [
             {
                 'type': 'command',
-                'command': f'{glaude_path} teleport-hook',
+                'command': f'{rclaude_path} teleport-hook',
             }
         ],
     }
@@ -172,14 +172,14 @@ def run_setup() -> None:
     """Run the interactive setup wizard."""
     click.echo()
     click.echo('┌' + '─' * 50 + '┐')
-    click.echo('│' + '           Glaude Setup Wizard'.center(50) + '│')
+    click.echo('│' + '           rclaude Setup Wizard'.center(50) + '│')
     click.echo('└' + '─' * 50 + '┘')
     click.echo()
 
     # Check if already configured
     existing = load_config()
     if existing.is_configured():
-        if not click.confirm('Glaude is already configured. Reconfigure?'):
+        if not click.confirm('rclaude is already configured. Reconfigure?'):
             return
 
     config = Config()
@@ -221,7 +221,7 @@ def run_setup() -> None:
     # Check if server is already running
     server_running = is_server_running()
     if server_running:
-        click.echo('  (Using running glaude server)')
+        click.echo('  (Using running rclaude server)')
 
     click.echo('  Waiting for link...', nl=False)
 
@@ -261,16 +261,16 @@ def run_setup() -> None:
     click.echo('─' * 40)
 
     if sys.platform == 'darwin':
-        if click.confirm('  Start glaude server on login?', default=False):
+        if click.confirm('  Start rclaude server on login?', default=False):
             if install_launchd():
                 click.echo('  ✓ LaunchAgent installed')
             else:
                 click.echo('  ✗ Failed to install LaunchAgent')
         else:
-            click.echo('  Skipped. Run manually with: glaude serve')
+            click.echo('  Skipped. Run manually with: rclaude serve')
     else:
         click.echo('  Auto-start not yet supported on this platform.')
-        click.echo('  Run manually with: glaude serve')
+        click.echo('  Run manually with: rclaude serve')
 
     click.echo()
 
@@ -282,8 +282,8 @@ def run_setup() -> None:
     click.echo('┌' + '─' * 50 + '┐')
     click.echo('│' + '           Setup Complete!'.center(50) + '│')
     click.echo('│' + ''.center(50) + '│')
-    click.echo('│' + '  • Run: glaude serve'.ljust(50) + '│')
-    click.echo('│' + '  • Then: glaude (to start Claude)'.ljust(50) + '│')
+    click.echo('│' + '  • Run: rclaude serve'.ljust(50) + '│')
+    click.echo('│' + '  • Then: rclaude (to start Claude)'.ljust(50) + '│')
     click.echo('│' + '  • Use /tg to teleport to Telegram'.ljust(50) + '│')
     click.echo('└' + '─' * 50 + '┘')
     click.echo()
@@ -336,7 +336,7 @@ async def run_link_bot(token: str, expected_token: str) -> tuple[int, str] | Non
 
     async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         assert update.message
-        await update.message.reply_text('Glaude Setup\n\nUse /link <token> to complete setup.\nThe token was shown in your terminal.')
+        await update.message.reply_text('rclaude Setup\n\nUse /link <token> to complete setup.\nThe token was shown in your terminal.')
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler('link', handle_link))
@@ -362,12 +362,12 @@ def install_launchd() -> bool:
     """Install a macOS LaunchAgent for auto-start."""
     import shutil
 
-    # Find glaude executable
-    glaude_path = shutil.which('glaude')
-    if not glaude_path:
-        # Fallback to python -m glaude
+    # Find rclaude executable
+    rclaude_path = shutil.which('rclaude')
+    if not rclaude_path:
+        # Fallback to python -m rclaude
         python_path = sys.executable
-        glaude_path = f'{python_path} -m glaude'
+        rclaude_path = f'{python_path} -m rclaude'
 
     plist_content = f"""\
 <?xml version="1.0" encoding="UTF-8"?>
@@ -375,10 +375,10 @@ def install_launchd() -> bool:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.glaude.server</string>
+    <string>com.rclaude.server</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{glaude_path}</string>
+        <string>{rclaude_path}</string>
         <string>serve</string>
     </array>
     <key>RunAtLoad</key>
@@ -386,9 +386,9 @@ def install_launchd() -> bool:
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/glaude.log</string>
+    <string>/tmp/rclaude.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/glaude.err</string>
+    <string>/tmp/rclaude.err</string>
 </dict>
 </plist>
 """
@@ -396,7 +396,7 @@ def install_launchd() -> bool:
     launch_agents = Path.home() / 'Library' / 'LaunchAgents'
     launch_agents.mkdir(parents=True, exist_ok=True)
 
-    plist_file = launch_agents / 'com.glaude.server.plist'
+    plist_file = launch_agents / 'com.rclaude.server.plist'
     plist_file.write_text(plist_content)
 
     return True

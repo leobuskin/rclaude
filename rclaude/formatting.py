@@ -14,7 +14,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 
 from claude_agent_sdk import ToolUseBlock, ToolResultBlock
 
-from glaude.config import MAX_MESSAGE_LENGTH, logger
+from rclaude.config import MAX_MESSAGE_LENGTH, logger
 
 
 def escape_html(text: str) -> str:

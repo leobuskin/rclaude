@@ -1,5 +1,5 @@
 [project]
-name = 'glaude'
+name = 'rclaude'
 description = 'Telegram bot for remote Claude Code control'
 requires-python = '>=3.14'
 dynamic = ['version']
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-glaude = 'glaude.__main__:main'
+rclaude = 'rclaude.__main__:main'
 
 [build-system]
 requires = ['setuptools>=64', 'setuptools-scm>=8']
@@ -22,7 +22,7 @@ build-backend = 'setuptools.build_meta'
 
 [tool.setuptools.packages.find]
 where = ['.']
-include = ['glaude*']
+include = ['rclaude*']
 
 [tool.setuptools_scm]
 version_scheme = 'guess-next-dev'

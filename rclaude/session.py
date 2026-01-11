@@ -10,7 +10,7 @@ from typing import Any
 from claude_agent_sdk import ClaudeSDKClient
 
 # File to persist session state across hot-reloads
-SESSION_STATE_FILE = Path('/tmp/glaude-session-state.json')
+SESSION_STATE_FILE = Path('/tmp/rclaude-session-state.json')
 
 
 @dataclass

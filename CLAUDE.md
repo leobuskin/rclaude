@@ -12,33 +12,33 @@ source .venv/bin/activate
 pip install -e .
 
 # Lint and format
-ruff check glaude/
-ruff check glaude/ --fix
-ruff format glaude/
+ruff check rclaude/
+ruff check rclaude/ --fix
+ruff format rclaude/
 
 # Type check
-ty check glaude/
+ty check rclaude/
 
 # Run the CLI
-glaude --help
-glaude setup      # Interactive setup wizard
-glaude serve      # Start HTTP + Telegram server
-glaude status     # Show configuration status
-glaude            # Run Claude Code with teleport support
+rclaude --help
+rclaude setup      # Interactive setup wizard
+rclaude serve      # Start HTTP + Telegram server
+rclaude status     # Show configuration status
+rclaude            # Run Claude Code with teleport support
 ```
 
 ## Architecture
 
-Glaude enables remote Claude Code control via Telegram with session teleportation between terminal and mobile.
+rclaude enables remote Claude Code control via Telegram with session teleportation between terminal and mobile.
 
 ### Core Components
 
 **CLI Layer** (`cli.py`, `__main__.py`)
 - Click-based CLI with commands: `setup`, `serve`, `run`, `status`, `uninstall`
-- Entry point at `glaude.__main__:main`
+- Entry point at `rclaude.__main__:main`
 
 **Configuration** (`settings.py`, `config.py`)
-- `settings.py`: New TOML-based config at `~/.config/glaude/config.toml`
+- `settings.py`: New TOML-based config at `~/.config/rclaude/config.toml`
 - `config.py`: Backward-compat layer that loads TOML or falls back to `.env`
 
 **Server** (`server.py`)
@@ -58,7 +58,7 @@ Glaude enables remote Claude Code control via Telegram with session teleportatio
 
 ### Teleportation Flow
 
-1. User runs `glaude` (wrapper starts server if needed, launches Claude)
+1. User runs `rclaude` (wrapper starts server if needed, launches Claude)
 2. In Claude, user runs `/tg` slash command
 3. Hook POSTs `{session_id, cwd}` to `localhost:7680/teleport`
 4. Server notifies user on Telegram
