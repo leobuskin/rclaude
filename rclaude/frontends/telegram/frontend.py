@@ -567,7 +567,7 @@ class TelegramFrontend(Frontend):
 
         await update.message.reply_text(text, parse_mode='HTML')
 
-    async def _handle_context(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _handle_context(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /context command."""
         if not await self._check_auth(update):
             return
@@ -575,7 +575,11 @@ class TelegramFrontend(Frontend):
 
         session = self._get_session(update.effective_user.id)
 
-        await self._query_and_process(session, '/context')
+        if not session.client:
+            await update.message.reply_text('No active session. Send a message first.')
+            return
+
+        await fetch_context(session)
 
         ctx = session.context
         if ctx.tokens_max > 0:
@@ -583,8 +587,9 @@ class TelegramFrontend(Frontend):
                 f'<b>Context Usage</b>\n\nUsed: {ctx.tokens_used:,} / {ctx.tokens_max:,}\nPercentage: <b>{ctx.percent_used}%</b>',
                 parse_mode='HTML',
             )
+            await self.update_status(session)
         else:
-            await update.message.reply_text('No context usage data available.')
+            await update.message.reply_text('No context data available.')
 
     async def _handle_compact(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /compact command."""
@@ -705,6 +710,20 @@ class TelegramFrontend(Frontend):
             )
         except Exception as e:
             logger.warning(f'Failed to send reload notification: {e}')
+
+    async def notify_reloading(self) -> None:
+        """Notify user that reload is happening now."""
+        if not self.allowed_user_id:
+            return
+
+        try:
+            await self.bot.send_message(
+                chat_id=self.allowed_user_id,
+                text='✓ <i>Reloading...</i>',
+                parse_mode='HTML',
+            )
+        except Exception as e:
+            logger.warning(f'Failed to send reloading notification: {e}')
 
     # ─────────────────────────────────────────────────────────────────────────
     # Callback Query Handler
@@ -941,7 +960,6 @@ class TelegramFrontend(Frontend):
             await fetch_context(session)
 
         if session.client:
-            session.is_processing = True
             await self._query_and_process(session, text)
             await self.update_status(session)
 
@@ -997,9 +1015,23 @@ class TelegramFrontend(Frontend):
         """Send a query to Claude and process the response."""
         if not session.client:
             return
-        await session.client.query(prompt)
-        async for event in process_response(session):
-            await self._handle_event_internal(session, event)
+
+        # Set processing flag for entire duration including event handling and context fetch
+        session.is_processing = True
+        try:
+            await session.client.query(prompt)
+            async for event in process_response(session):
+                await self._handle_event_internal(session, event)
+                # Check if we hit AskUserQuestion (pending_question set, waiting for user)
+                if session.pending_question:
+                    # Exit early - we're paused waiting for user input
+                    session.is_processing = False
+                    return
+
+            # Refresh context after agentic loop completes
+            await fetch_context(session)
+        finally:
+            session.is_processing = False
 
     async def _submit_question_answers(self, session: Session, answers: dict[str, str]) -> None:
         """Submit question answers to Claude and process response."""

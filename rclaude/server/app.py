@@ -177,6 +177,11 @@ async def handle_prepare_reload(request: web.Request) -> web.Response:
     request.app['reload_pending'] = False
     request.app['force_reload'] = False
 
+    # Notify user that reload is happening now
+    frontend = request.app.get('telegram_frontend')
+    if frontend:
+        await frontend.notify_reloading()
+
     # Disconnect all clients
     for session in session_manager.all_sessions():
         if session.client:
