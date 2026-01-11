@@ -125,9 +125,57 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({'status': 'ok'})
 
 
+async def handle_can_reload(request: web.Request) -> web.Response:
+    """Check if server can safely reload (all sessions idle)."""
+    session_manager: SessionManager = request.app['session_manager']
+
+    sessions = session_manager.all_sessions()
+    any_processing = any(s.is_processing for s in sessions)
+    reload_pending = request.app.get('reload_pending', False)
+    force_reload = request.app.get('force_reload', False)
+
+    return web.json_response({
+        'can_reload': not any_processing,
+        'force_reload': force_reload,
+        'reload_pending': reload_pending,
+        'sessions': len(sessions),
+        'processing': sum(1 for s in sessions if s.is_processing),
+    })
+
+
+async def handle_request_reload(request: web.Request) -> web.Response:
+    """Signal that a reload is requested. Notifies users and sets pending flag."""
+    request.app['reload_pending'] = True
+
+    # Notify via Telegram frontend if available
+    frontend = request.app.get('telegram_frontend')
+    if frontend:
+        await frontend.notify_reload_pending()
+
+    session_manager: SessionManager = request.app['session_manager']
+    sessions = session_manager.all_sessions()
+    any_processing = any(s.is_processing for s in sessions)
+
+    return web.json_response({
+        'ok': True,
+        'can_reload': not any_processing,
+        'waiting': any_processing,
+    })
+
+
+async def handle_force_reload(request: web.Request) -> web.Response:
+    """Force reload flag - allows reload even if processing."""
+    request.app['force_reload'] = True
+    return web.json_response({'ok': True, 'message': 'Force reload enabled'})
+
+
 async def handle_prepare_reload(request: web.Request) -> web.Response:
     """Prepare for hot-reload by saving session state."""
     session_manager: SessionManager = request.app['session_manager']
+
+    # Clear reload flags
+    request.app['reload_pending'] = False
+    request.app['force_reload'] = False
 
     # Disconnect all clients
     for session in session_manager.all_sessions():
@@ -298,6 +346,9 @@ def create_app(
 
     app.router.add_post('/teleport', handle_teleport)
     app.router.add_get('/health', handle_health)
+    app.router.add_get('/api/can-reload', handle_can_reload)
+    app.router.add_post('/api/request-reload', handle_request_reload)
+    app.router.add_post('/api/force-reload', handle_force_reload)
     app.router.add_post('/api/prepare-reload', handle_prepare_reload)
     app.router.add_get('/stream', handle_stream)
     app.router.add_post('/api/setup-link', handle_setup_link_register)
@@ -322,6 +373,12 @@ async def run_server(config: Config) -> None:
 
     # Create HTTP app
     http_app = create_app(config, session_manager, frontend_registry)
+
+    # Store telegram_frontend reference for reload notifications
+    telegram_frontend = frontend_registry.get('telegram')
+    if isinstance(telegram_frontend, TelegramFrontend):
+        http_app['telegram_frontend'] = telegram_frontend
+        telegram_frontend.set_http_app(http_app)
 
     # Start HTTP server
     runner = web.AppRunner(http_app)

@@ -79,6 +79,9 @@ In Telegram, send `/cc` to get the command for resuming in terminal. The session
 | `/new` | Start fresh session |
 | `/cc` | Return to terminal |
 | `/status` | Show session info |
+| `/mode` | Change permission mode |
+| `/model` | Change AI model |
+| `/cost` | Show usage costs |
 | `/stop` | Interrupt current task |
 | `/cancel` | Cancel pending teleport |
 
@@ -112,9 +115,9 @@ rclaude ────────────────────────
 
 1. **Wrapper** (`rclaude`) spawns Claude Code and monitors for `/tg`
 2. **Hook** intercepts `/tg`, POSTs session info to local server
-3. **Server** notifies you on Telegram, streams updates back to terminal
-4. **SDK** continues the conversation via Telegram messages
-5. **Return** with `/cc` resumes the session in terminal
+3. **Server** notifies via Telegram frontend, streams events back to terminal via SSE
+4. **SDK** continues the conversation via Telegram messages with interactive permissions
+5. **Return** with `/cc` emits event to terminal, shows resume command
 
 ## CLI Reference
 

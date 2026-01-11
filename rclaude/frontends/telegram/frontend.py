@@ -75,10 +75,16 @@ class TelegramFrontend(Frontend):
         self._pending_teleports: dict[int, dict[str, Any]] = {}
         # Session manager reference (set by server)
         self._session_manager: Any = None
+        # HTTP app reference (set by server for reload control)
+        self._http_app: Any = None
 
     def set_session_manager(self, manager: Any) -> None:
         """Set the session manager reference."""
         self._session_manager = manager
+
+    def set_http_app(self, app: Any) -> None:
+        """Set the HTTP app reference for reload control."""
+        self._http_app = app
 
     @property
     def bot(self) -> Bot:
@@ -132,6 +138,7 @@ class TelegramFrontend(Frontend):
         self.app.add_handler(CommandHandler('stop', self._handle_stop))
         self.app.add_handler(CommandHandler('cancel', self._handle_cancel))
         self.app.add_handler(CommandHandler('link', self._handle_link))
+        self.app.add_handler(CommandHandler('reload', self._handle_reload))
 
         # Callback query handler
         self.app.add_handler(CallbackQueryHandler(self._handle_callback))
@@ -664,6 +671,40 @@ class TelegramFrontend(Frontend):
             await update.message.reply_text(f'✓ Linked! User ID: {update.effective_user.id}')
         else:
             await update.message.reply_text('Invalid or expired token.')
+
+    async def _handle_reload(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /reload command - force server hot-reload."""
+        if not await self._check_auth(update):
+            return
+        assert update.message
+
+        if not self._http_app:
+            await update.message.reply_text('Reload not available (no server reference)')
+            return
+
+        # Check if reload is pending
+        reload_pending = self._http_app.get('reload_pending', False)
+        if not reload_pending:
+            await update.message.reply_text('No reload pending. Save a file to trigger reload.')
+            return
+
+        # Set force reload flag
+        self._http_app['force_reload'] = True
+        await update.message.reply_text('✓ Force reload triggered')
+
+    async def notify_reload_pending(self) -> None:
+        """Notify user that a reload is pending."""
+        if not self.allowed_user_id:
+            return
+
+        try:
+            await self.bot.send_message(
+                chat_id=self.allowed_user_id,
+                text='🔄 <i>Code changed, reload pending...</i>',
+                parse_mode='HTML',
+            )
+        except Exception as e:
+            logger.warning(f'Failed to send reload notification: {e}')
 
     # ─────────────────────────────────────────────────────────────────────────
     # Callback Query Handler

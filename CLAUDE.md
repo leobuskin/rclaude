@@ -32,32 +32,60 @@ rclaude -- -c      # Pass args to Claude (e.g., continue last session)
 
 rclaude enables remote Claude Code control via Telegram with session teleportation between terminal and mobile.
 
+### Package Structure
+
+```
+rclaude/
+  cli.py, __main__.py     # CLI layer
+  wrapper.py              # Claude CLI wrapper
+  settings.py, config.py  # Configuration
+  setup_wizard.py         # Interactive setup
+
+  core/                   # Frontend-agnostic components
+    events.py             # Event types (TextEvent, ToolCallEvent, etc.)
+    session.py            # Session, SessionManager
+    permissions.py        # Permission logic, smart rule generation
+    claude_client.py      # Claude SDK wrapper
+
+  server/                 # HTTP server
+    app.py                # aiohttp routes and server
+
+  frontends/              # Frontend implementations
+    base.py               # Frontend protocol/ABC
+    telegram/             # Telegram frontend
+      frontend.py         # TelegramFrontend class
+      formatting.py       # Telegram-specific formatting
+      keyboards.py        # Inline keyboard builders
+```
+
 ### Core Components
 
 **CLI Layer** (`cli.py`, `__main__.py`)
 - Click-based CLI with commands: `setup`, `serve`, `status`, `uninstall`
 - Default action (no subcommand) runs Claude with teleport support
 - Use `--` to pass arguments to Claude: `rclaude -- --resume <id>`
-- Entry point at `rclaude.__main__:main`
 
 **Configuration** (`settings.py`, `config.py`)
-- `settings.py`: New TOML-based config at `~/.config/rclaude/config.toml`
+- `settings.py`: TOML-based config at `~/.config/rclaude/config.toml`
 - `config.py`: Backward-compat layer that loads TOML or falls back to `.env`
 
-**Server** (`server.py`)
-- Combined aiohttp HTTP server + python-telegram-bot in single async loop
-- HTTP endpoint `POST /teleport` receives session handoffs from `/tg` hook
-- Telegram handlers for `/start`, `/new`, `/cc`, `/status`, `/stop`, `/cancel`
+**Core** (`core/`)
+- `session.py`: Frontend-agnostic Session with event queue, SessionManager with frontend mapping
+- `events.py`: Typed event classes for the message bus between core and frontends
+- `permissions.py`: Permission checking, rule management, smart Bash rule generation via Haiku
+- `claude_client.py`: SDK wrapper, permission handler factory, response processing
+
+**Server** (`server/app.py`)
+- aiohttp HTTP server with routes: `/teleport`, `/health`, `/stream`, `/api/setup-link`
+- SSE endpoint streams session events to terminal
+
+**Frontends** (`frontends/`)
+- `base.py`: Frontend protocol defining `send_text`, `request_permission`, etc.
+- `telegram/`: TelegramFrontend with handlers for `/start`, `/new`, `/cc`, `/mode`, `/model`, `/status`, `/stop`, `/cancel`
 
 **Claude Wrapper** (`wrapper.py`)
 - Spawns `claude` CLI via pexpect with PTY
 - Auto-starts server in background if not running
-- Handles terminal resize signals
-
-**Setup Wizard** (`setup_wizard.py`)
-- Interactive setup: bot token validation, Telegram account linking via `/link` command
-- Installs `/tg` hook to `~/.claude/commands/tg.md`
-- Optional macOS LaunchAgent for auto-start
 
 ### Teleportation Flow
 
@@ -66,15 +94,7 @@ rclaude enables remote Claude Code control via Telegram with session teleportati
 3. Hook POSTs `{session_id, cwd}` to `localhost:7680/teleport`
 4. Server notifies user on Telegram
 5. User continues session on mobile via Claude Agent SDK with `resume=session_id`
-6. `/cc` in Telegram shows command to resume in terminal
-
-### Session Management (`session.py`)
-
-Sessions keyed by Telegram user ID. `UserSession` dataclass holds:
-- `ClaudeSDKClient` instance
-- Processing state
-- Pending `AskUserQuestion` interactions
-- Working directory
+6. `/cc` in Telegram emits `ReturnToTerminalEvent`, shows resume command
 
 ## Code Style
 

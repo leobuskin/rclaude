@@ -103,17 +103,18 @@ def serve(reload: bool, verbose: bool) -> None:
 def _serve_with_reload(config, verbose: bool = False) -> None:
     """Run server with hot-reload on code changes.
 
-    Uses graceful shutdown to preserve session state across restarts.
+    Uses deferred reload - waits for agent to finish processing before restarting.
     """
+    import json
     import subprocess
+    import time
     import urllib.request
-    import urllib.error
     from pathlib import Path
 
     import watchfiles
 
-    # Find the rclaude package directory
     rclaude_dir = Path(__file__).parent
+    base_url = f'http://{config.server.host}:{config.server.port}'
 
     click.echo(f'Starting rclaude server on {config.server.host}:{config.server.port} (reload mode)...')
     click.echo(f'Watching: {rclaude_dir}')
@@ -128,19 +129,37 @@ def _serve_with_reload(config, verbose: bool = False) -> None:
         proc = subprocess.Popen(cmd)
         return proc
 
+    def api_call(endpoint: str, method: str = 'GET') -> dict | None:
+        """Make API call to server, return JSON or None on error."""
+        try:
+            req = urllib.request.Request(f'{base_url}{endpoint}', method=method)
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                return json.loads(resp.read())
+        except Exception:
+            return None
+
+    def wait_for_idle() -> bool:
+        """Wait until all sessions are idle or force reload requested."""
+        while True:
+            status = api_call('/api/can-reload')
+            if status is None:
+                return True  # Server down, can reload
+
+            if status.get('can_reload') or status.get('force_reload'):
+                return True
+
+            processing = status.get('processing', 0)
+            click.echo(f'  Waiting for {processing} session(s) to finish...')
+            time.sleep(0.5)
+
     def stop_server_gracefully():
         """Stop server with graceful shutdown to save session state."""
         nonlocal proc
         if proc is None:
             return
 
-        # First, tell server to save state via HTTP endpoint
-        try:
-            url = f'http://{config.server.host}:{config.server.port}/api/prepare-reload'
-            req = urllib.request.Request(url, method='POST')
-            urllib.request.urlopen(req, timeout=2)
-        except Exception:
-            pass  # Server might already be down
+        # Save state before shutdown
+        api_call('/api/prepare-reload', method='POST')
 
         # Send SIGTERM for graceful shutdown
         proc.terminate()
@@ -155,7 +174,6 @@ def _serve_with_reload(config, verbose: bool = False) -> None:
     start_server()
 
     try:
-        # Watch for changes
         for changes in watchfiles.watch(
             rclaude_dir,
             watch_filter=watchfiles.PythonFilter(),
@@ -163,7 +181,15 @@ def _serve_with_reload(config, verbose: bool = False) -> None:
             step=300,
         ):
             changed_files = [str(c[1]) for c in changes]
-            click.echo(f'Reloading... (changed: {changed_files})')
+            click.echo(f'Changes detected: {changed_files}')
+
+            # Notify user that reload is pending
+            result = api_call('/api/request-reload', method='POST')
+            if result and result.get('waiting'):
+                click.echo('Reload pending - waiting for agent to finish...')
+                wait_for_idle()
+
+            click.echo('Reloading...')
             stop_server_gracefully()
             start_server()
     except KeyboardInterrupt:
