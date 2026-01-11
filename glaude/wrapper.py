@@ -30,7 +30,7 @@ def is_server_running(config: Config) -> bool:
     return result == 0
 
 
-def start_server_background(config: Config, reload: bool = False) -> subprocess.Popen:
+def start_server_background(config: Config, reload: bool = False, verbose: bool = False) -> subprocess.Popen:
     """Start the glaude server in the background."""
     # Find the glaude executable
     import shutil
@@ -43,15 +43,24 @@ def start_server_background(config: Config, reload: bool = False) -> subprocess.
 
     if reload:
         cmd.append('--reload')
+    if verbose:
+        cmd.append('--verbose')
 
     # Start in background
-    # In reload mode, keep stderr visible for debugging
+    # In verbose/reload mode, keep stderr visible for debugging
+    show_output = reload or verbose
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
-        stderr=None if reload else subprocess.DEVNULL,
+        stderr=None if show_output else subprocess.DEVNULL,
         start_new_session=True,
     )
+
+    # Save watcher PID so server can kill it on shutdown (for reload mode)
+    wrapper_pid = os.environ.get('GLAUDE_WRAPPER_PID')
+    if wrapper_pid and reload:
+        pid_file = Path(f'/tmp/glaude-watcher-{wrapper_pid}.pid')
+        pid_file.write_text(str(proc.pid))
 
     # Wait for server to be ready (longer timeout for reload mode due to watchfiles startup)
     timeout = 100 if reload else 50  # 10s vs 5s
@@ -128,7 +137,7 @@ def stream_session_updates(config: Config, session_id: str) -> tuple[str | None,
             return None, True  # User wants to stop
 
 
-def run_claude_wrapper(config: Config, args: list[str], reload: bool = False) -> int:
+def run_claude_wrapper(config: Config, args: list[str], reload: bool = False, verbose: bool = False) -> int:
     """Run Claude Code with teleportation support.
 
     This spawns Claude as a subprocess and monitors for teleport signals.
@@ -153,6 +162,8 @@ def run_claude_wrapper(config: Config, args: list[str], reload: bool = False) ->
     env['GLAUDE_WRAPPER_PID'] = str(os.getpid())
     if reload:
         env['GLAUDE_RELOAD'] = '1'
+    if verbose:
+        env['GLAUDE_VERBOSE'] = '1'
 
     # Track state for teleport cycles
     teleport_data: dict | None = None

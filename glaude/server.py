@@ -68,11 +68,31 @@ def _get_shutdown_event() -> asyncio.Event:
     return _shutdown_event
 
 
+def _get_watcher_pid_file(wrapper_pid: int) -> Path:
+    """Get the watcher PID file path for a given wrapper."""
+    return Path(f'/tmp/glaude-watcher-{wrapper_pid}.pid')
+
+
 def _trigger_shutdown() -> None:
-    """Trigger server shutdown."""
+    """Trigger server shutdown and kill watcher if running in reload mode."""
+    import signal as sig
+
     event = _get_shutdown_event()
     event.set()
     logger.info('[SHUTDOWN] Server shutdown triggered')
+
+    # Kill watcher process if we have its PID (based on wrapper PID from env)
+    wrapper_pid = os.environ.get('GLAUDE_WRAPPER_PID')
+    if wrapper_pid:
+        pid_file = _get_watcher_pid_file(int(wrapper_pid))
+        if pid_file.exists():
+            try:
+                watcher_pid = int(pid_file.read_text().strip())
+                os.kill(watcher_pid, sig.SIGTERM)
+                logger.info(f'[SHUTDOWN] Sent SIGTERM to watcher pid {watcher_pid}')
+                pid_file.unlink(missing_ok=True)
+            except (ValueError, OSError, ProcessLookupError) as e:
+                logger.warning(f'[SHUTDOWN] Could not kill watcher: {e}')
 
 
 def get_local_claude_cli() -> str | None:
@@ -400,10 +420,15 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
                 update = await asyncio.wait_for(session.update_queue.get(), timeout=30)
                 data = json.dumps({'type': update.type, 'content': update.content})
                 await response.write(f'event: update\ndata: {data}\n\n'.encode())
+
+                # Exit loop after sending return_to_terminal (session returning to terminal)
+                if update.type == 'return_to_terminal':
+                    logger.info('[SSE] Sent return_to_terminal, closing connection')
+                    break
             except asyncio.TimeoutError:
                 # Send keepalive
                 await response.write(b'event: keepalive\ndata: {}\n\n')
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, ConnectionResetError):
         pass
     finally:
         # Track disconnection
