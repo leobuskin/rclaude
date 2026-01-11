@@ -550,13 +550,22 @@ def create_permission_handler(
         keyboard = create_permission_keyboard(tool_name)
 
         try:
-            await bot.send_message(
-                chat_id=user_id,
-                text=text,
-                reply_markup=keyboard,
-                parse_mode='HTML',
+            await asyncio.wait_for(
+                bot.send_message(
+                    chat_id=user_id,
+                    text=text,
+                    reply_markup=keyboard,
+                    parse_mode='HTML',
+                    disable_notification=False,  # User action required - notify with sound
+                ),
+                timeout=10,
             )
             logger.info('[PERMISSION] Sent permission prompt to Telegram')
+        except asyncio.TimeoutError:
+            logger.warning('[PERMISSION] Timeout sending permission prompt (10s), allowing operation')
+            # On timeout, allow the operation (fail-open for usability)
+            session.pending_permission = None
+            return PermissionResultAllow(updated_input=input_data)
         except Exception as e:
             logger.error(f'Failed to send permission prompt: {e}')
             # On error, allow the operation (fail-open for usability)
@@ -679,23 +688,35 @@ async def handle_teleport(request: web.Request) -> web.Response:
         permission_mode=permission_mode,
     )
 
-    # Notify via Telegram
+    # Notify via Telegram (fire and forget with timeout to avoid blocking HTTP response)
     bot = request.app['telegram_app'].bot
     mode_display = _format_mode_display(permission_mode)
-    try:
-        await bot.send_message(
-            chat_id=user_id,
-            text=f'📱 Session teleported from terminal!\n\n'
-            f'Session: `{session_id[:8]}...`\n'
-            f'Terminal: `{terminal_id[:8]}...`\n'
-            f'Directory: `{cwd}`\n'
-            f'Mode: {mode_display}\n\n'
-            f'Send any message to continue, or /cancel to ignore.',
-            parse_mode='Markdown',
-        )
-    except Exception as e:
-        logger.error(f'Failed to send Telegram notification: {e}')
-        return web.json_response({'error': f'Failed to notify: {e}'}, status=500)
+
+    async def send_notification():
+        """Send notification with timeout to avoid blocking."""
+        try:
+            await asyncio.wait_for(
+                bot.send_message(
+                    chat_id=user_id,
+                    text=f'📱 Session teleported from terminal!\n\n'
+                    f'Session: `{session_id[:8]}...`\n'
+                    f'Terminal: `{terminal_id[:8]}...`\n'
+                    f'Directory: `{cwd}`\n'
+                    f'Mode: {mode_display}\n\n'
+                    f'Send any message to continue, or /cancel to ignore.',
+                    parse_mode='Markdown',
+                    disable_notification=False,  # Enable sound notification for teleport
+                ),
+                timeout=10,
+            )
+            logger.info('[TELEPORT] Notification sent successfully')
+        except asyncio.TimeoutError:
+            logger.warning('Timeout sending teleport notification (10s), continuing anyway')
+        except Exception as e:
+            logger.error(f'Failed to send Telegram notification: {e}')
+
+    # Send notification asynchronously without blocking the HTTP response
+    asyncio.create_task(send_notification())
 
     return web.json_response({'ok': True, 'message': 'Teleport initiated'})
 
@@ -1429,6 +1450,7 @@ async def _handle_question_callback(
             await update.effective_chat.send_message(
                 f'{next_q.get("header", "Question")}: {next_q["question"]}',
                 reply_markup=keyboard,
+                disable_notification=False,  # Sound enabled - requires user action
             )
         else:
             session.pending_question = None
@@ -1521,6 +1543,8 @@ async def _process_response(
     response_text = ''
     # Track tool call messages for editing with results: tool_use_id -> (message_id, text)
     tool_messages: dict[str, tuple[int, str]] = {}
+    # Track whether we've received ResultMessage (signals task completion)
+    is_final_message = False
 
     try:
         async for message in session.client.receive_response():
@@ -1530,9 +1554,9 @@ async def _process_response(
                         response_text += block.text
 
                     elif isinstance(block, ToolUseBlock):
-                        # Send any accumulated text first
+                        # Send any accumulated text first (silently - intermediate processing)
                         if response_text.strip():
-                            await send_text(update, response_text)
+                            await send_text(update, response_text, disable_notification=True)
                             await session.update_queue.put(SessionUpdate('text', response_text))
                             response_text = ''
 
@@ -1550,13 +1574,14 @@ async def _process_response(
                                     f'<b>{first_q.get("header", "Question")}:</b> {first_q["question"]}',
                                     reply_markup=keyboard,
                                     parse_mode='HTML',
+                                    disable_notification=False,  # Sound enabled - requires user action
                                 )
                                 await session.update_queue.put(SessionUpdate('question', first_q['question']))
                                 session.is_processing = False
                                 return
 
-                        # Send tool call as formatted message and track for result editing
-                        msg_info = await send_tool_call(update, block)
+                        # Send tool call as formatted message and track for result editing (silently)
+                        msg_info = await send_tool_call(update, block, disable_notification=True)
                         if msg_info and block.id:
                             tool_messages[block.id] = msg_info
                         tool_desc = (
@@ -1579,8 +1604,9 @@ async def _process_response(
                     # List of blocks
                     for block in content:
                         if isinstance(block, ToolResultBlock):
+                            # Send tool result silently (intermediate processing)
                             msg_info = tool_messages.get(block.tool_use_id)
-                            await send_tool_result(update, block, msg_info)
+                            await send_tool_result(update, block, msg_info, disable_notification=True)
                         elif isinstance(block, TextBlock):
                             if '<local-command-stdout>' in block.text:
                                 context_usage = _parse_context_output(block.text)
@@ -1632,16 +1658,21 @@ async def _process_response(
                     session.usage.total_output_tokens += message.usage.get('output_tokens', 0)
                 logger.info(f'[USAGE] Cost: ${message.total_cost_usd or 0:.4f}, Total: ${session.usage.total_cost_usd:.4f}')
 
+                # Mark that the next message should be the final one (with sound notification)
+                is_final_message = True
+
     except Exception as e:
         logger.error(f'Error processing response: {e}')
         response_text += f'\n\n❌ Error: {e}'
+        # Errors are also final messages (should notify with sound)
+        is_final_message = True
 
     finally:
         session.is_processing = False
 
-    # Send any remaining text
+    # Send any remaining text - with sound notification if this is the final message
     if response_text.strip():
-        await send_text(update, response_text)
+        await send_text(update, response_text, disable_notification=not is_final_message)
         await session.update_queue.put(SessionUpdate('text', response_text))
 
     # Update pinned status message (cost/context may have changed)
