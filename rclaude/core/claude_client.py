@@ -171,8 +171,7 @@ async def process_response(session: Session) -> AsyncIterator[Event]:
     if not session.client:
         return
 
-    # Note: is_processing is managed by the caller (_query_and_process)
-    # to ensure it stays True until ALL events are fully handled
+    session.is_processing = True
     response_text = ''
     tool_calls: dict[str, ToolCallEvent] = {}  # tool_id -> event
     is_final = False
@@ -203,7 +202,7 @@ async def process_response(session: Session) -> AsyncIterator[Event]:
                                     question_id=block.id,
                                     questions=questions,
                                 )
-                                # Caller checks pending_question and handles is_processing
+                                session.is_processing = False
                                 return
 
                         # Emit tool call event
@@ -278,8 +277,8 @@ async def process_response(session: Session) -> AsyncIterator[Event]:
         yield ErrorEvent(session_id=session.id, message=str(e))
         is_final = True
 
-    # Note: is_processing is managed by the caller, not here
-    # This ensures the flag stays True until ALL events are fully handled
+    finally:
+        session.is_processing = False
 
     # Send any remaining text
     if response_text.strip():
@@ -300,15 +299,7 @@ async def fetch_context(session: Session) -> None:
                     context_usage = parse_context_output(str(text_content))
                     if context_usage:
                         session.context = context_usage
-                        logger.debug(f'[CONTEXT] Fetched: {context_usage.percent_used}%')
-                        return
-            elif isinstance(message, UserMessage):
-                content = message.content
-                if isinstance(content, str):
-                    context_usage = parse_context_output(content)
-                    if context_usage:
-                        session.context = context_usage
-                        logger.debug(f'[CONTEXT] Fetched: {context_usage.percent_used}%')
+                        logger.info(f'[CONTEXT] Fetched: {context_usage.percent_used}%')
                         return
     except Exception as e:
         logger.warning(f'Failed to fetch context: {e}')
