@@ -87,7 +87,7 @@ def markdown_to_telegram_html(text: str) -> str:
     return text
 
 
-async def send_text(update: Update, text: str) -> None:
+async def send_text(update: Update, text: str, disable_notification: bool = False) -> None:
     """Send a text message with HTML formatting (markdown converted)."""
     assert update.effective_chat
 
@@ -99,16 +99,20 @@ async def send_text(update: Update, text: str) -> None:
     # Split into chunks if needed
     chunks = _split_text(html_text, MAX_MESSAGE_LENGTH)
 
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         if chunk.strip():
+            # All chunks silent except the last one
+            is_last_chunk = (i == len(chunks) - 1)
+            chunk_disable_notification = True if not is_last_chunk else disable_notification
+
             try:
-                await update.effective_chat.send_message(chunk, parse_mode='HTML')
+                await update.effective_chat.send_message(chunk, parse_mode='HTML', disable_notification=chunk_disable_notification)
             except Exception as e:
                 logger.error(f'Failed to send HTML message: {e}')
                 # Fallback to plain text
                 try:
                     plain = re.sub(r'<[^>]+>', '', chunk)
-                    await update.effective_chat.send_message(plain[:MAX_MESSAGE_LENGTH])
+                    await update.effective_chat.send_message(plain[:MAX_MESSAGE_LENGTH], disable_notification=chunk_disable_notification)
                 except Exception as e2:
                     logger.error(f'Failed to send plain message: {e2}')
 
@@ -157,7 +161,7 @@ def format_tool_call(block: ToolUseBlock) -> str | None:
         return f'🔧 <b>{escape_html(tool_name)}</b>'
 
 
-async def send_tool_call(update: Update, block: ToolUseBlock) -> tuple[int, str] | None:
+async def send_tool_call(update: Update, block: ToolUseBlock, disable_notification: bool = False) -> tuple[int, str] | None:
     """Send a tool call as a formatted message. Returns (message_id, text) for later editing."""
     assert update.effective_chat
 
@@ -166,7 +170,7 @@ async def send_tool_call(update: Update, block: ToolUseBlock) -> tuple[int, str]
         return None
 
     try:
-        msg = await update.effective_chat.send_message(text, parse_mode='HTML')
+        msg = await update.effective_chat.send_message(text, parse_mode='HTML', disable_notification=disable_notification)
         return (msg.message_id, text)
     except Exception as e:
         logger.error(f'Failed to send tool call: {e}')
@@ -217,6 +221,7 @@ async def send_tool_result(
     update: Update,
     block: ToolResultBlock,
     tool_msg_info: tuple[int, str] | None = None,
+    disable_notification: bool = False,
 ) -> None:
     """Send/update a tool result. If tool_msg_info provided, edit the original message."""
     assert update.effective_chat
@@ -250,6 +255,7 @@ async def send_tool_result(
             result_text,
             parse_mode='HTML',
             reply_to_message_id=message_id,
+            disable_notification=disable_notification,
         )
     except Exception as e:
         logger.error(f'Failed to send tool result: {e}')
@@ -258,7 +264,7 @@ async def send_tool_result(
         try:
             content = block.content
             plain = str(content)[:1000] if content else ''
-            await update.effective_chat.send_message(f'{icon} {plain}')
+            await update.effective_chat.send_message(f'{icon} {plain}', disable_notification=disable_notification)
         except Exception:
             pass
 
