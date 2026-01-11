@@ -746,7 +746,7 @@ class TelegramFrontend(Frontend):
         data: str,
     ) -> None:
         """Handle question answer selection."""
-        assert update.callback_query and context.user_data is not None
+        assert update.callback_query
         query = update.callback_query
 
         pending = session.pending_question
@@ -762,7 +762,7 @@ class TelegramFrontend(Frontend):
         current_q = pending.questions[pending.current_question_idx]
 
         if answer == 'other':
-            context.user_data['waiting_for_answer'] = True
+            session.waiting_for_question_answer = True
             await query.edit_message_text('Type your answer:')
             return
 
@@ -849,7 +849,7 @@ class TelegramFrontend(Frontend):
         """Handle text messages."""
         if not await self._check_auth(update):
             return
-        assert update.effective_user and update.message and update.message.text and context.user_data is not None
+        assert update.effective_user and update.message and update.message.text
 
         session = self._get_session(update.effective_user.id)
         text = update.message.text
@@ -869,8 +869,8 @@ class TelegramFrontend(Frontend):
             return
 
         # Handle waiting for custom answer
-        if context.user_data.get('waiting_for_answer') and session.pending_question:
-            context.user_data['waiting_for_answer'] = False
+        if session.waiting_for_question_answer and session.pending_question:
+            session.waiting_for_question_answer = False
             pending = session.pending_question
             current_q = pending.questions[pending.current_question_idx]
             pending.answers[current_q['question']] = text

@@ -80,6 +80,7 @@ class Session:
     pending_question: PendingQuestion | None = None
     pending_permission: PendingPermission | None = None
     waiting_for_rejection_reason: bool = False
+    waiting_for_question_answer: bool = False
 
     # Usage tracking
     usage: SessionUsage = field(default_factory=SessionUsage)
