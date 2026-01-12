@@ -168,7 +168,9 @@ async def process_response(session: Session) -> AsyncIterator[Event]:
     This is a generator that yields events as they come from the SDK.
     The caller is responsible for handling each event type appropriately.
     """
+    logger.info('[PROCESS] process_response called')
     if not session.client:
+        logger.warning('[PROCESS] No client, returning')
         return
 
     session.is_processing = True
@@ -177,15 +179,22 @@ async def process_response(session: Session) -> AsyncIterator[Event]:
     is_final = False
 
     try:
+        logger.info('[PROCESS] Starting to receive response from SDK')
+        message_count = 0
         async for message in session.client.receive_response():
+            message_count += 1
+            logger.info(f'[PROCESS] Received message #{message_count}: {type(message).__name__}')
             if isinstance(message, AssistantMessage):
+                logger.debug(f'[SDK] AssistantMessage: {len(message.content)} blocks')
                 for block in message.content:
                     if isinstance(block, TextBlock):
+                        logger.debug(f'[SDK] TextBlock: len={len(block.text)}')
                         response_text += block.text
 
                     elif isinstance(block, ToolUseBlock):
                         # Send any accumulated text first
                         if response_text.strip():
+                            logger.info(f'[YIELD] TextEvent (pre-tool): len={len(response_text)}')
                             yield TextEvent(session_id=session.id, content=response_text, is_final=False)
                             response_text = ''
 
@@ -253,6 +262,7 @@ async def process_response(session: Session) -> AsyncIterator[Event]:
                         session.context = context_usage
 
             elif isinstance(message, ResultMessage):
+                logger.info(f'[RESULT] is_error={message.is_error}, result={message.result}, session_id={message.session_id[:8] if message.session_id else None}..., num_turns={message.num_turns}')
                 if message.is_error and message.result:
                     response_text += f'\n\n❌ Error: {message.result}'
 
@@ -272,17 +282,20 @@ async def process_response(session: Session) -> AsyncIterator[Event]:
 
                 is_final = True
 
+        # Send any remaining text - inside try so is_processing stays True during handling
+        if response_text.strip():
+            logger.info(f'[YIELD] TextEvent (final): len={len(response_text)}, is_final={is_final}')
+            yield TextEvent(session_id=session.id, content=response_text, is_final=is_final)
+        else:
+            logger.info(f'[YIELD] No final text (response_text empty or whitespace)')
+
     except Exception as e:
-        logger.error(f'Error processing response: {e}')
+        logger.error(f'[PROCESS] Exception in process_response: {e}')
         yield ErrorEvent(session_id=session.id, message=str(e))
-        is_final = True
 
     finally:
+        logger.info('[PROCESS] process_response finished, setting is_processing=False')
         session.is_processing = False
-
-    # Send any remaining text
-    if response_text.strip():
-        yield TextEvent(session_id=session.id, content=response_text, is_final=is_final)
 
 
 async def fetch_context(session: Session) -> None:
@@ -292,6 +305,7 @@ async def fetch_context(session: Session) -> None:
 
     try:
         await session.client.query('/context')
+        # Must consume ALL messages from the stream, not just until we find context
         async for message in session.client.receive_response():
             if isinstance(message, SystemMessage):
                 text_content = message.data.get('message') or message.data.get('text') or message.data.get('result')
@@ -299,7 +313,17 @@ async def fetch_context(session: Session) -> None:
                     context_usage = parse_context_output(str(text_content))
                     if context_usage:
                         session.context = context_usage
-                        logger.info(f'[CONTEXT] Fetched: {context_usage.percent_used}%')
-                        return
+                        logger.debug(f'[CONTEXT] Fetched: {context_usage.percent_used}%')
+                        # Don't return - keep consuming until stream ends
+            elif isinstance(message, UserMessage):
+                content = message.content
+                if isinstance(content, str):
+                    context_usage = parse_context_output(content)
+                    if context_usage:
+                        session.context = context_usage
+                        logger.debug(f'[CONTEXT] Fetched from UserMessage: {context_usage.percent_used}%')
+                        # Don't return - keep consuming until stream ends
+            elif isinstance(message, ResultMessage):
+                logger.debug(f'[CONTEXT] ResultMessage received, stream complete')
     except Exception as e:
         logger.warning(f'Failed to fetch context: {e}')

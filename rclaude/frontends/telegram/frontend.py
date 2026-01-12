@@ -6,6 +6,7 @@ from typing import Any, cast
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from telegram import Bot, Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -35,6 +36,7 @@ from rclaude.core.events import (
     TextEvent,
     ToolCallEvent,
     ToolResultEvent,
+    UserMessageEvent,
 )
 from rclaude.core.session import PendingPermission
 from rclaude.frontends.base import Frontend
@@ -477,7 +479,7 @@ class TelegramFrontend(Frontend):
             if new_mode:
                 session.permission_mode = cast(PermissionMode, new_mode)
                 if session.client:
-                    session.client.set_permission_mode(new_mode)
+                    await session.client.set_permission_mode(new_mode)
                 from rclaude.core import format_mode_display
 
                 await update.message.reply_text(
@@ -567,7 +569,7 @@ class TelegramFrontend(Frontend):
 
         await update.message.reply_text(text, parse_mode='HTML')
 
-    async def _handle_context(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _handle_context(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /context command."""
         if not await self._check_auth(update):
             return
@@ -575,7 +577,11 @@ class TelegramFrontend(Frontend):
 
         session = self._get_session(update.effective_user.id)
 
-        await self._query_and_process(session, '/context')
+        if not session.client:
+            await update.message.reply_text('No active session. Send a message first.')
+            return
+
+        await fetch_context(session)
 
         ctx = session.context
         if ctx.tokens_max > 0:
@@ -583,8 +589,9 @@ class TelegramFrontend(Frontend):
                 f'<b>Context Usage</b>\n\nUsed: {ctx.tokens_used:,} / {ctx.tokens_max:,}\nPercentage: <b>{ctx.percent_used}%</b>',
                 parse_mode='HTML',
             )
+            await self.update_status(session)
         else:
-            await update.message.reply_text('No context usage data available.')
+            await update.message.reply_text('No context data available.')
 
     async def _handle_compact(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /compact command."""
@@ -706,6 +713,20 @@ class TelegramFrontend(Frontend):
         except Exception as e:
             logger.warning(f'Failed to send reload notification: {e}')
 
+    async def notify_reloading(self) -> None:
+        """Notify user that reload is happening now."""
+        if not self.allowed_user_id:
+            return
+
+        try:
+            await self.bot.send_message(
+                chat_id=self.allowed_user_id,
+                text='✓ <i>Reloading...</i>',
+                parse_mode='HTML',
+            )
+        except Exception as e:
+            logger.warning(f'Failed to send reloading notification: {e}')
+
     # ─────────────────────────────────────────────────────────────────────────
     # Callback Query Handler
     # ─────────────────────────────────────────────────────────────────────────
@@ -769,7 +790,7 @@ class TelegramFrontend(Frontend):
             # Enable acceptEdits mode
             session.permission_mode = 'acceptEdits'
             if session.client:
-                session.client.set_permission_mode('acceptEdits')
+                await session.client.set_permission_mode('acceptEdits')
             pending.result = PermissionResultAllow(updated_input=pending.input_data)
             await query.edit_message_text('✓ Allowed + Accept Edits mode enabled')
             await self.update_status(session)
@@ -849,7 +870,7 @@ class TelegramFrontend(Frontend):
         session.permission_mode = cast(PermissionMode, validate_permission_mode(mode))
 
         if session.client:
-            session.client.set_permission_mode(session.permission_mode)
+            await session.client.set_permission_mode(session.permission_mode)
 
         await query.edit_message_text(f'✓ Mode changed to: <b>{session.permission_mode}</b>', parse_mode='HTML')
         await self.update_status(session)
@@ -931,19 +952,33 @@ class TelegramFrontend(Frontend):
             return
 
         # Normal message - send to Claude
+        logger.info(f'[MESSAGE] Normal message, client exists: {session.client is not None}')
+
+        # Show typing indicator
+        await update.message.chat.send_action(ChatAction.TYPING)
+
         if not session.client:
             # Create new client
+            logger.info('[MESSAGE] Creating new client...')
             permission_handler = create_permission_handler(
                 session,
                 lambda s, p: self.request_permission(s, p),
             )
             await create_client(session, permission_handler)
+            logger.info('[MESSAGE] Client created, fetching context...')
             await fetch_context(session)
+            logger.info('[MESSAGE] Context fetched')
 
         if session.client:
+            logger.info('[MESSAGE] Sending to Claude...')
+            # Emit user message to SSE for terminal
+            await session.emit(UserMessageEvent(session_id=session.id, content=text))
             session.is_processing = True
             await self._query_and_process(session, text)
+            logger.info('[MESSAGE] Query processing complete')
             await self.update_status(session)
+        else:
+            logger.error('[MESSAGE] No client after creation attempt!')
 
     async def _setup_session_from_teleport(
         self,
@@ -982,24 +1017,46 @@ class TelegramFrontend(Frontend):
 
     async def _handle_event_internal(self, session: Session, event: Any) -> None:
         """Handle an event from Claude internally."""
-        if isinstance(event, TextEvent):
-            await self.send_text(session, event.content, event.is_final)
-        elif isinstance(event, ToolCallEvent):
-            await self.send_tool_call(session, event)
-        elif isinstance(event, ToolResultEvent):
-            await self.send_tool_result(session, event, None)
-        elif isinstance(event, QuestionEvent):
-            await self.request_question_answer(session, event)
-        elif isinstance(event, ErrorEvent):
-            await self.send_text(session, f'❌ Error: {event.message}', is_final=True)
+        # Emit to event queue for SSE streaming to terminal
+        await session.emit(event)
+
+        # Refresh typing indicator while processing
+        try:
+            await self.bot.send_chat_action(self.allowed_user_id, ChatAction.TYPING)
+        except Exception:
+            pass  # Best-effort, don't fail on typing indicator errors
+
+        # Handle for Telegram display
+        try:
+            if isinstance(event, TextEvent):
+                logger.debug(f'[EVENT] TextEvent: len={len(event.content)}, is_final={event.is_final}')
+                await self.send_text(session, event.content, event.is_final)
+            elif isinstance(event, ToolCallEvent):
+                await self.send_tool_call(session, event)
+            elif isinstance(event, ToolResultEvent):
+                await self.send_tool_result(session, event, None)
+            elif isinstance(event, QuestionEvent):
+                await self.request_question_answer(session, event)
+            elif isinstance(event, ErrorEvent):
+                await self.send_text(session, f'❌ Error: {event.message}', is_final=True)
+        except Exception as e:
+            logger.error(f'[EVENT] Error handling {type(event).__name__}: {e}')
 
     async def _query_and_process(self, session: Session, prompt: str) -> None:
         """Send a query to Claude and process the response."""
+        logger.info(f'[QUERY] _query_and_process called, client={session.client is not None}')
         if not session.client:
+            logger.warning('[QUERY] No client, returning')
             return
+        logger.info(f'[QUERY] Calling query with prompt: {prompt[:50]}...')
         await session.client.query(prompt)
+        logger.info('[QUERY] Query sent, starting to process response')
+        event_count = 0
         async for event in process_response(session):
+            event_count += 1
+            logger.info(f'[QUERY] Received event #{event_count}: {type(event).__name__}')
             await self._handle_event_internal(session, event)
+        logger.info(f'[QUERY] Done processing, total events: {event_count}')
 
     async def _submit_question_answers(self, session: Session, answers: dict[str, str]) -> None:
         """Submit question answers to Claude and process response."""

@@ -9,7 +9,7 @@ EventType = Literal[
     'tool_result',
     'question',
     'permission_request',
-    'user_message',
+    'user',
     'session_start',
     'session_end',
     'return_to_terminal',
@@ -79,7 +79,7 @@ class PermissionRequestEvent(Event):
 class UserMessageEvent(Event):
     """User message sent to Claude."""
 
-    type: ClassVar[Literal['user_message']] = 'user_message'
+    type: ClassVar[Literal['user']] = 'user'
     content: str = ''
 
 
